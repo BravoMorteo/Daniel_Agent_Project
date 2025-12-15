@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HeyGen + ElevenLabs con LiveKit (Público)</title>
+    <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f0f0f0;
+        }
+        .controls {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+        }
+        button {
+            padding: 10px 20px;
+            margin: 5px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        #startBtn { background: #4CAF50; color: white; }
+        #startBtn:disabled { background: #cccccc; }
+        #stopBtn { background: #f44336; color: white; }
+        video {
+            width: 100%;
+            max-height: 500px;
+            background: white;
+            border-radius: 10px;
+            display: block;
+            min-height: 400px;
+        }
+        #status {
+            background: #333;
+            color: #0f0;
+            padding: 10px;
+            border-radius: 5px;
+            font-family: monospace;
+            font-size: 12px;
+            max-height: 200px;
+            overflow-y: auto;
+            margin-top: 10px;
+        }
+        .transcription {
+            background: white;
+            padding: 15px;
+            border-radius: 10px;
+            margin-top: 10px;
+            min-height: 100px;
+        }
+        .url-info {
+            background: #e3f2fd;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 10px;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <h1>🎬 HeyGen Avatar + ElevenLabs IA</h1>
+    <p><strong>LiveKit Integration (Versión Pública)</strong></p>
+    
+    <div class="url-info">
+        <strong>🌐 Conectando a:</strong> <span id="urlInfo">Detectando...</span>
+    </div>
+    
+    <div class="controls">
+        <button id="startBtn">▶️ Iniciar Conversación</button>
+        <button id="stopBtn">⏹️ Detener</button>
+        <button id="debugBtn" style="background: #ff9800;">🔍 Debug Video</button>
+    </div>
+
+    <video id="videoElement" autoplay playsinline muted></video>
+
+    <div class="transcription">
+        <h3>💬 Transcripciones</h3>
+        <div id="transcription"></div>
+    </div>
+
+    <div id="status"></div>
+
+    <script>
+        // Detectar URL automáticamente
+        const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/hybrid`;
+        
+        document.getElementById('urlInfo').textContent = wsUrl;
+        
+        // Configuración
+        let sessionInfo = null;
+        let room = null;
+        let mediaStream = null;
+        let ws_client = null;
+        let ws_elevenlabs = null;
+
+        const videoElement = document.getElementById('videoElement');
+        const statusElement = document.getElementById('status');
+        const transcriptionElement = document.getElementById('transcription');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+
+        // Eventos del video element para debugging
+        videoElement.addEventListener('loadstart', () => log('🎬 Video: loadstart'));
+        videoElement.addEventListener('loadedmetadata', () => log('📊 Video: metadata cargada'));
+        videoElement.addEventListener('loadeddata', () => log('📦 Video: data cargada'));
+        videoElement.addEventListener('canplay', () => log('▶️ Video: can play'));
+        videoElement.addEventListener('canplaythrough', () => log('⏩ Video: can play through'));
+        videoElement.addEventListener('playing', () => log('🎥 Video: REPRODUCIENDO'));
+        videoElement.addEventListener('error', (e) => {
+            log(`❌ Video ERROR: ${e.message || 'Unknown error'}`);
+            if (videoElement.error) {
+                log(`   Code: ${videoElement.error.code}, Message: ${videoElement.error.message}`);
+            }
+        });
+        videoElement.addEventListener('stalled', () => log('⏸️ Video: stalled'));
+        videoElement.addEventListener('waiting', () => log('⏳ Video: waiting'));
+
+        function log(msg) {
+            const time = new Date().toLocaleTimeString();
+            statusElement.innerHTML += `[${time}] ${msg}<br>`;
+            statusElement.scrollTop = statusElement.scrollHeight;
+            console.log(msg);
+        }
+
+        function addTranscription(text, type = 'user') {
+            const color = type === 'user' ? '#0066cc' : '#cc0000';
+            const prefix = type === 'user' ? '👤 Tú' : '🤖 IA';
+            transcriptionElement.innerHTML += `<p style="color:${color}"><strong>${prefix}:</strong> ${text}</p>`;
+        }
+
+        async function startConversation() {
+            try {
+                startBtn.disabled = true;
+                log('🚀 Iniciando conversación...');
+                log(`🔗 Conectando a: ${wsUrl}`);
+
+                // Conectar al servidor WebSocket (auto-detecta localhost o ngrok)
+                ws_client = new WebSocket(wsUrl);
+                
+                ws_client.onopen = () => {
+                    log('✅ Conectado al servidor');
+                };
+
+                ws_client.onmessage = async (event) => {
+                    const data = JSON.parse(event.data);
+                    
+                    if (data.type === 'avatar_ready') {
+                        log(`✅ Avatar creado: ${data.session_id}`);
+                        sessionInfo = data;
+                        
+                        // Iniciar LiveKit
+                        await setupLiveKit();
+                        
+                        // Notificar al servidor
+                        ws_client.send(JSON.stringify({ type: 'client_ready' }));
+                    }
+                    else if (data.type === 'elevenlabs_connected') {
+                        log('✅ ElevenLabs conectado');
+                        // Iniciar captura de micrófono
+                        await startMicrophone();
+                    }
+                    else if (data.type === 'user_transcript') {
+                        addTranscription(data.text, 'user');
+                    }
+                    else if (data.type === 'agent_response') {
+                        addTranscription(data.text, 'agent');
+                    }
+                };
+
+                ws_client.onerror = (error) => {
+                    log(`❌ Error WebSocket: ${error}`);
+                };
+
+                ws_client.onclose = () => {
+                    log('🔴 Conexión cerrada');
+                    startBtn.disabled = false;
+                };
+
+            } catch (error) {
+                log(`❌ Error: ${error.message}`);
+                startBtn.disabled = false;
+            }
+        }
+
+        async function setupLiveKit() {
+            try {
+                log('🔗 Configurando LiveKit...');
+                
+                // Crear LiveKit Room
+                room = new LivekitClient.Room({
+                    adaptiveStream: true,
+                    dynacast: true,
+                    videoCaptureDefaults: {
+                        resolution: LivekitClient.VideoPresets.h720.resolution
+                    }
+                });
+
+                // Manejar PARTICIPANTES remotos (no tracks individuales)
+                room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, publication, participant) => {
+                    log(`📺 Track recibido de ${participant.identity}: ${track.kind}`);
+                    
+                    if (track.kind === 'video') {
+                        // Attach retorna un elemento <video> completo ya configurado
+                        const element = track.attach();
+                        
+                        // Log de diagnóstico
+                        log(`🔍 Video creado: readyState=${element.readyState}`);
+                        log(`🔍 srcObject: ${element.srcObject ? 'OK' : 'NULL'}`);
+                        if (element.srcObject) {
+                            const tracks = element.srcObject.getTracks();
+                            log(`🔍 Tracks: ${tracks.length} (${tracks.map(t => t.kind).join(', ')})`);
+                        }
+                        
+                        // Configurar propiedades
+                        element.autoplay = true;
+                        element.playsInline = true;
+                        element.muted = false;
+                        element.style.display = 'block';
+                        element.style.width = '100%';
+                        element.style.height = '100%';
+                        element.style.objectFit = 'cover';
+                        element.style.backgroundColor = '#fff';
+                        
+                        // Eventos de diagnóstico
+                        element.addEventListener('loadstart', () => {
+                            log(`🎬 Video: loadstart (readyState=${element.readyState})`);
+                        });
+                        element.addEventListener('loadedmetadata', () => {
+                            log(`📐 Metadata cargada: ${element.videoWidth}x${element.videoHeight}`);
+                        });
+                        element.addEventListener('canplay', () => {
+                            log('✅ Video: canplay - intentando play...');
+                            element.play().catch(e => log(`❌ Play falló: ${e.message}`));
+                        });
+                        element.addEventListener('playing', () => {
+                            log('▶️ Video: PLAYING!');
+                        });
+                        element.addEventListener('waiting', () => log('⏳ Video: waiting'));
+                        element.addEventListener('stalled', () => log('⚠️ Video: stalled'));
+                        element.addEventListener('suspend', () => log('⏸️ Video: suspend'));
+                        element.addEventListener('error', (e) => {
+                            log(`❌ Video error: ${e.target.error?.message || 'unknown'}`);
+                        });
+                        
+                        // REEMPLAZAR el elemento completo en el DOM
+                        const oldElement = document.getElementById('videoElement');
+                        if (oldElement) {
+                            oldElement.replaceWith(element);
+                            element.id = 'videoElement';
+                            videoElement = element;
+                            log(`✅ Video element REEMPLAZADO en DOM`);
+                        }
+                        
+                        // Forzar reproducción
+                        setTimeout(() => {
+                            log(`🔄 Forzando play... readyState=${element.readyState}`);
+                            element.play().then(() => {
+                                log('✅ Play forzado exitoso');
+                            }).catch(e => {
+                                log(`⚠️ Play forzado falló: ${e.message}`);
+                            });
+                        }, 500);
+                    }
+                    
+                    if (track.kind === 'audio') {
+                        // Para audio, attach directo (no usar el videoElement para audio)
+                        const audioElement = track.attach();
+                        audioElement.autoplay = true;
+                        document.body.appendChild(audioElement);
+                        log(`🔊 Audio reproduciendo desde ${participant.identity}`);
+                    }
+                });
+
+                room.on(LivekitClient.RoomEvent.TrackUnsubscribed, (track, publication, participant) => {
+                    log(`🔴 Track removido de ${participant.identity}: ${track.kind}`);
+                    track.detach();
+                });
+
+                room.on(LivekitClient.RoomEvent.Disconnected, (reason) => {
+                    log(`🔴 LiveKit desconectado: ${reason}`);
+                });
+
+                // Manejar participantes que ya están en la sala
+                room.on(LivekitClient.RoomEvent.ParticipantConnected, (participant) => {
+                    log(`👥 Participante conectado: ${participant.identity}`);
+                });
+
+                // Detectar errores de media
+                room.on(LivekitClient.RoomEvent.MediaDevicesError, (error) => {
+                    log(`❌ Error de dispositivos: ${error}`);
+                });
+
+                room.on(LivekitClient.RoomEvent.ConnectionQualityChanged, (quality, participant) => {
+                    log(`📶 Calidad conexión: ${quality}`);
+                });
+
+                // Conectar a LiveKit
+                await room.connect(sessionInfo.url, sessionInfo.access_token);
+                log('✅ Conectado a LiveKit Room');
+                
+                // Procesar participantes existentes (avatar ya en la sala)
+                room.participants.forEach((participant) => {
+                    log(`👥 Procesando participante existente: ${participant.identity}`);
+                    participant.trackPublications.forEach((publication) => {
+                        if (publication.isSubscribed && publication.track) {
+                            log(`📺 Track existente: ${publication.track.kind}`);
+                            
+                            if (publication.track.kind === 'video') {
+                                const tempElement = publication.track.attach();
+                                if (tempElement.srcObject) {
+                                    videoElement.srcObject = tempElement.srcObject;
+                                    videoElement.muted = false;
+                                    videoElement.play().then(() => {
+                                        log(`✅ Video reproduciendo (participante existente)`);
+                                        videoElement.style.display = 'block';
+                                    }).catch(e => {
+                                        log(`⚠️ Error play: ${e.message}`);
+                                    });
+                                }
+                            }
+                            
+                            if (publication.track.kind === 'audio') {
+                                const audioElement = publication.track.attach();
+                                audioElement.autoplay = true;
+                                document.body.appendChild(audioElement);
+                                log(`🔊 Audio configurado (participante existente)`);
+                            }
+                        }
+                    });
+                });
+
+            } catch (error) {
+                log(`❌ Error LiveKit: ${error.message}`);
+            }
+        }
+
+        async function startMicrophone() {
+            try {
+                log('🎤 Solicitando micrófono...');
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        sampleRate: 16000
+                    }
+                });
+                
+                log('✅ Micrófono capturado');
+                
+                // Crear procesador de audio
+                const audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 16000
+                });
+                const source = audioContext.createMediaStreamSource(stream);
+                const processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+
+                processor.onaudioprocess = (e) => {
+                    if (ws_client && ws_client.readyState === WebSocket.OPEN) {
+                        const inputData = e.inputBuffer.getChannelData(0);
+                        
+                        // Convertir a PCM16
+                        const pcm16 = new Int16Array(inputData.length);
+                        for (let i = 0; i < inputData.length; i++) {
+                            const s = Math.max(-1, Math.min(1, inputData[i]));
+                            pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                        }
+                        
+                        // Enviar al servidor
+                        ws_client.send(pcm16.buffer);
+                    }
+                };
+
+                log('🎙️ Captura de audio activa');
+                
+            } catch (error) {
+                log(`❌ Error de micrófono: ${error.message}`);
+            }
+        }
+
+        async function stopConversation() {
+            log('⏹️ Deteniendo conversación...');
+            
+            if (room) {
+                room.disconnect();
+                room = null;
+            }
+            
+            if (ws_client) {
+                ws_client.close();
+                ws_client = null;
+            }
+            
+            if (videoElement.srcObject) {
+                videoElement.srcObject.getTracks().forEach(track => track.stop());
+                videoElement.srcObject = null;
+            }
+            
+            sessionInfo = null;
+            mediaStream = null;
+            startBtn.disabled = false;
+            
+            log('✅ Conversación detenida');
+        }
+
+        // Event listeners
+        startBtn.addEventListener('click', startConversation);
+        stopBtn.addEventListener('click', stopConversation);
+        
+        document.getElementById('debugBtn').addEventListener('click', () => {
+            log('🔍 DEBUG INFO:');
+            log(`- Video element: ${videoElement ? 'exists' : 'missing'}`);
+            log(`- srcObject: ${videoElement.srcObject ? 'assigned' : 'null'}`);
+            log(`- readyState: ${videoElement.readyState}`);
+            log(`- paused: ${videoElement.paused}`);
+            log(`- muted: ${videoElement.muted}`);
+            if (mediaStream) {
+                log(`- Video tracks: ${mediaStream.getVideoTracks().length}`);
+                log(`- Audio tracks: ${mediaStream.getAudioTracks().length}`);
+                mediaStream.getVideoTracks().forEach((track, i) => {
+                    log(`  Track ${i}: ${track.label} - enabled: ${track.enabled} - readyState: ${track.readyState}`);
+                });
+            }
+            
+            // Intentar forzar play
+            videoElement.play().then(() => {
+                log('✅ Video play() exitoso');
+            }).catch(e => {
+                log(`❌ Video play() falló: ${e.message}`);
+            });
+        });
+
+        log('✅ Listo para comenzar');
+        log(`🌐 Modo: ${isLocalhost ? 'LOCALHOST' : 'PÚBLICO (ngrok/internet)'}`);
+    </script>
+</body>
+</html>

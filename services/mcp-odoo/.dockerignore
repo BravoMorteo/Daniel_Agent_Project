@@ -1,0 +1,29 @@
+# Ignorar entornos virtuales
+.venv
+.venv*/
+__pycache__/
+
+# Archivos sensibles
+.env
+*.env
+
+# Archivos que NO deben ir dentro del contenedor
+.git
+.gitignore
+
+# Archivos de entorno
+.env
+*.env
+.env.*
+test*
+RESUMEN_SALES.md
+start*
+manage.sh
+ARQUITECTURA_COMPLETA.md
+CAMBIOS_CONSOLIDACION.md
+COMO_USAR_MCP_VENTAS.md
+EJEMPLOS_SALES.md
+GUIA_INICIO_SERVIDOR.md
+INDEX.md
+QUICK_START.md
+check_products.py

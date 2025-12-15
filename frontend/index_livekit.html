@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HeyGen + ElevenLabs con LiveKit</title>
+    
+    <!-- External Libraries -->
+    <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+    
+    <!-- Styles -->
+    <link rel="stylesheet" href="css/main.css">
+</head>
+<body>
+    <h1>🎬 HeyGen Avatar + ElevenLabs IA</h1>
+    <p><strong>LiveKit Integration</strong></p>
+    
+    <div class="controls">
+        <button id="startBtn">▶️ Iniciar Conversación</button>
+        <button id="stopBtn">⏹️ Detener</button>
+        <button id="debugBtn">🔍 Debug Video</button>
+    </div>
+
+    <video id="videoElement" autoplay playsinline muted></video>
+
+    <div class="transcription">
+        <h3>💬 Transcripciones</h3>
+        <div id="transcription"></div>
+    </div>
+
+    <div id="status"></div>
+
+    <!-- Application Scripts -->
+    <script src="js/config.js"></script>
+    <script src="js/utils.js"></script>
+    <script src="js/videoHandler.js"></script>
+    <script src="js/audioHandler.js"></script>
+    <script src="js/livekitHandler.js"></script>
+    <script src="js/websocketHandler.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
