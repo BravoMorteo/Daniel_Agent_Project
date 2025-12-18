@@ -59,19 +59,21 @@ _mcp_app_internal = mcp.streamable_http_app()
 async def mcp_app(scope, receive, send):
     """
     Wrapper ASGI que permite cualquier host y delega al MCP app real.
-    Necesario para compatibilidad con ngrok y otros proxies.
+    Necesario para compatibilidad con App Runner, ngrok y otros proxies.
+
+    FastMCP valida el Host header contra una lista de hosts permitidos.
+    Este wrapper siempre usa 'localhost:8000' internamente para FastMCP,
+    permitiendo conexiones desde cualquier dominio externo.
     """
     if scope["type"] == "http":
-        # Guardar headers originales
-        original_headers = scope.get("headers", [])
-
-        # Filtrar y reemplazar el header Host
+        # Reemplazar el header Host con localhost para FastMCP
+        headers = list(scope.get("headers", []))
         new_headers = []
         host_found = False
 
-        for name, value in original_headers:
+        for name, value in headers:
             if name.lower() == b"host":
-                # Reemplazar con localhost para pasar la validación
+                # Siempre usar localhost:8000 para FastMCP
                 new_headers.append((b"host", b"localhost:8000"))
                 host_found = True
             else:
@@ -82,7 +84,6 @@ async def mcp_app(scope, receive, send):
 
         scope["headers"] = new_headers
 
-    # Delegar al app MCP real
     await _mcp_app_internal(scope, receive, send)
 
 

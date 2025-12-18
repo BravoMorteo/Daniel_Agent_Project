@@ -45,9 +45,13 @@ class DevOdooCRMClient:
                 "Faltan credenciales DEV_ODOO_LOGIN o DEV_ODOO_API_KEY en .env"
             )
 
-        # Conexión XML-RPC a desarrollo
-        self.common = xmlrpc.client.ServerProxy(f"{self.url}/xmlrpc/2/common")
-        self.models = xmlrpc.client.ServerProxy(f"{self.url}/xmlrpc/2/object")
+        # Conexión XML-RPC a desarrollo con allow_none=True para manejar valores None
+        self.common = xmlrpc.client.ServerProxy(
+            f"{self.url}/xmlrpc/2/common", allow_none=True
+        )
+        self.models = xmlrpc.client.ServerProxy(
+            f"{self.url}/xmlrpc/2/object", allow_none=True
+        )
 
         # Autenticación
         self.uid = self.common.authenticate(self.db, self.username, self.password, {})
@@ -89,6 +93,79 @@ class DevOdooCRMClient:
         """Marca una oportunidad como ganada."""
         return self.execute_kw("crm.lead", "action_set_won", [[lead_id]])
 
+    def get_salesperson_with_least_opportunities(self) -> int | None:
+        """
+        Obtiene el ID del vendedor (user) con menos oportunidades activas.
+
+        Criterios:
+        - Obtiene miembros de los equipos de ventas (ID 1 y 14)
+        - Solo cuenta oportunidades activas (type='opportunity')
+        - Solo cuenta oportunidades en etapas específicas (1, 2, 10, 3)
+        - Retorna el user_id con menor cantidad de oportunidades activas
+
+        Returns:
+            int: ID del vendedor con menos carga, o None si no hay vendedores
+        """
+        from collections import defaultdict
+
+        # 1. Obtener miembros de los equipos de ventas (ID 1 y 14)
+        teams = self.search_read(
+            "crm.team",
+            [("id", "in", [14])],  # 14 es el equipo de ventas servibot
+            ["member_ids"],
+        )
+
+        members_ids = set()
+        for team in teams:
+            members_ids.update(team.get("member_ids", []))
+
+        members_ids = list(members_ids)
+
+        if not members_ids:
+            return None
+
+        # 2. Obtener todas las oportunidades activas en etapas específicas
+        leads = self.search_read(
+            "crm.lead",
+            [
+                ("stage_id", "in", [1, 2, 10, 3]),
+                ("active", "=", True),
+                ("type", "=", "opportunity"),
+            ],
+            ["user_id"],
+            limit=None,  # Sin límite para obtener todas
+        )
+
+        # 3. Contar oportunidades activas por vendedor
+        opportunities_by_user = defaultdict(int)
+
+        for lead in leads:
+            user_info = lead.get("user_id")
+
+            # Filtrar solo usuarios que están en los equipos
+            if not user_info or user_info[0] not in members_ids:
+                continue
+
+            user_id = user_info[0]
+            user_name = user_info[1]
+
+            if user_id not in opportunities_by_user:
+                opportunities_by_user[user_id] = {
+                    "name": user_name,
+                    "count": 0,
+                }
+            opportunities_by_user[user_id]["count"] += 1
+
+        # 4. Encontrar el vendedor con menos oportunidades
+        if not opportunities_by_user:
+            return None
+
+        least_user_id = min(
+            opportunities_by_user, key=lambda uid: opportunities_by_user[uid]["count"]
+        )
+
+        return least_user_id
+
 
 def register(mcp, deps: dict):
     """
@@ -112,7 +189,7 @@ def register(mcp, deps: dict):
 
     @mcp.tool(
         name="dev_create_quotation",
-        description="Crea una cotización completa en desarrollo: verifica/crea partner → crea lead → convierte a oportunidad → genera cotización",
+        description="Crea una cotización completa en desarrollo: verifica/crea partner → asigna vendedor por balanceo de carga → crea lead → convierte a oportunidad → genera cotización",
     )
     def dev_create_quotation(
         partner_name: str,
@@ -120,43 +197,55 @@ def register(mcp, deps: dict):
         email: str,
         phone: str,
         lead_name: str,
-        user_id: Optional[int] = None,
-        product_id: Optional[int] = None,
+        user_id: int = 0,
+        product_id: int = 0,
         product_qty: float = 1.0,
-        product_price: Optional[float] = None,
+        product_price: float = -1.0,
     ) -> QuotationResult:
         """
         Crea una cotización completa siguiendo el flujo de ventas de Odoo.
 
         Flujo:
         1. Verifica si existe el partner (res.partner) por email, si no existe lo crea
-        2. Crea un lead (crm.lead) tipo 'lead'
+           - Búsqueda EXACTA por campo 'email' en res.partner
+           - Si existe: reutiliza el partner
+           - Si NO existe: crea nuevo partner con los datos proporcionados
+        1.5. Asigna vendedor (user_id) automáticamente si no se especifica
+           - Aplica balanceo de carga: asigna al vendedor con menos oportunidades activas
+           - Excluye oportunidades ganadas y perdidas del conteo
+        2. Crea un lead (crm.lead) tipo 'lead' con email_from
         3. Convierte el lead a oportunidad (type='opportunity')
         4. Genera una cotización/orden de venta asociada a la oportunidad
 
         Args:
             partner_name: Nombre del cliente/empresa
             contact_name: Nombre del contacto
-            email: Email del contacto
+            email: Email del contacto (se busca en res.partner.email y se guarda en crm.lead.email_from)
             phone: Teléfono del contacto
             lead_name: Nombre del lead/oportunidad (ej: "Cotización Robot Limpieza")
-            user_id: ID del vendedor (res.users), opcional
-            product_id: ID del producto a cotizar, opcional
+            user_id: ID del vendedor (res.users), 0 = asignación automática por balanceo de carga
+            product_id: ID del producto a cotizar, 0 = sin producto
             product_qty: Cantidad del producto, default 1.0
-            product_price: Precio unitario, opcional (usa precio del producto si no se especifica)
+            product_price: Precio unitario manual, -1.0 = obtiene automáticamente el precio del producto
 
         Returns:
             QuotationResult con los IDs de todos los registros creados
+
+        Nota:
+            - La búsqueda de partners es por email EXACTO (no parcial)
+            - El email se guarda como 'email' en res.partner y como 'email_from' en crm.lead
         """
         client = get_dev_client()
         steps = {}
 
         # PASO 1: Verificar/Crear Partner (res.partner)
-        # Buscar partner existente por email
+        # Buscar partner existente por email (el campo en res.partner es 'email')
+        # pero usamos el valor que viene en el parámetro 'email' que se guardará como 'email_from' en el lead
+        email_normalizado = email.strip().lower()
         existing_partners = client.search_read(
             "res.partner",
-            [("email", "=", email)],
-            ["id", "name", "email"],
+            [("email", "=", email_normalizado)],  # Busca en res.partner.email
+            ["id", "name", "email", "phone"],
             limit=1,
         )
 
@@ -164,13 +253,13 @@ def register(mcp, deps: dict):
             partner_id = existing_partners[0]["id"]
             partner_full_name = existing_partners[0]["name"]
             steps["partner"] = (
-                f"Partner existente encontrado: {partner_full_name} (ID: {partner_id})"
+                f"✓ Partner existente encontrado por email '{email}': {partner_full_name} (ID: {partner_id})"
             )
         else:
             # Crear nuevo partner
             partner_values = {
-                "name": partner_name,
-                "email": email,
+                "name": contact_name,
+                "email": email,  # Se guarda en res.partner.email
                 "phone": phone,
                 "is_company": False,
                 "type": "contact",
@@ -178,7 +267,25 @@ def register(mcp, deps: dict):
             partner_id = client.create("res.partner", partner_values)
             partner_full_name = partner_name
             steps["partner"] = (
-                f"Nuevo partner creado: {partner_full_name} (ID: {partner_id})"
+                f"✓ Nuevo partner creado con email '{email}': {partner_full_name} (ID: {partner_id})"
+            )
+
+        # PASO 1.5: Asignar vendedor si no se especificó
+        assigned_user_id = user_id
+        if not assigned_user_id:
+            # Aplicar balanceo de carga: asignar al vendedor con menos oportunidades activas
+            assigned_user_id = client.get_salesperson_with_least_opportunities()
+            if assigned_user_id:
+                steps["user_assignment"] = (
+                    f"✓ Vendedor asignado automáticamente por balanceo de carga (ID: {assigned_user_id})"
+                )
+            else:
+                steps["user_assignment"] = (
+                    "⚠️ No se pudo asignar vendedor automáticamente (no hay usuarios disponibles)"
+                )
+        else:
+            steps["user_assignment"] = (
+                f"✓ Vendedor especificado manualmente (ID: {assigned_user_id})"
             )
 
         # PASO 2: Crear Lead (crm.lead) tipo 'lead'
@@ -192,8 +299,8 @@ def register(mcp, deps: dict):
             "partner_id": partner_id,
         }
 
-        if user_id:
-            lead_values["user_id"] = user_id
+        if assigned_user_id:
+            lead_values["user_id"] = assigned_user_id
 
         lead_id = client.create("crm.lead", lead_values)
         steps["lead"] = f"Lead creado: {lead_name} (ID: {lead_id})"
@@ -206,7 +313,11 @@ def register(mcp, deps: dict):
         client.write(
             "crm.lead",
             lead_id,
-            {"type": "opportunity", "date_conversion": conversion_date},
+            {
+                "type": "opportunity",
+                "date_conversion": conversion_date,
+                "stage_id": 3,
+            },  # 3 = Oportunidad en etapa cotizacion
         )
         steps["opportunity"] = (
             f"Lead convertido a oportunidad (ID: {lead_id}) - Fecha conversión: {conversion_date}"
@@ -226,8 +337,8 @@ def register(mcp, deps: dict):
             "note": f"<p>Cotización generada desde oportunidad: {lead_name}</p>",
         }
 
-        if user_id:
-            sale_values["user_id"] = user_id
+        if assigned_user_id:
+            sale_values["user_id"] = assigned_user_id
 
         sale_order_id = client.create("sale.order", sale_values)
 
@@ -240,21 +351,32 @@ def register(mcp, deps: dict):
         )
 
         # PASO 5 (Opcional): Agregar línea de producto si se especificó
-        if product_id:
+        if product_id > 0:
             line_values = {
                 "order_id": sale_order_id,
                 "product_id": product_id,
                 "product_uom_qty": product_qty,
             }
 
-            if product_price:
+            # Si se especifica precio manual (> 0), usarlo. Si no, obtener del producto
+            if product_price >= 0:
                 line_values["price_unit"] = product_price
+                steps["product_line_note"] = (
+                    f"Precio manual especificado: ${product_price}"
+                )
+            else:
+                # Obtener precio del producto automáticamente
+                product_data = client.read(
+                    "product.product", product_id, ["list_price", "name"]
+                )
+                line_values["price_unit"] = product_data.get("list_price", 0.0)
+                steps["product_line_note"] = (
+                    f"Precio obtenido del producto '{product_data.get('name')}': "
+                    f"${product_data.get('list_price', 0.0)}"
+                )
 
             line_id = client.create("sale.order.line", line_values)
             steps["product_line"] = f"Línea de producto agregada (ID: {line_id})"
-
-        # Verificar que la orden esté asociada a la oportunidad
-        opportunity_data = client.read("crm.lead", lead_id, ["order_ids"])
 
         return QuotationResult(
             partner_id=partner_id,
