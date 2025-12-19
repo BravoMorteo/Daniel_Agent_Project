@@ -106,8 +106,6 @@ class DevOdooCRMClient:
         Returns:
             int: ID del vendedor con menos carga, o None si no hay vendedores
         """
-        from collections import defaultdict
-
         # 1. Obtener miembros de los equipos de ventas (ID 1 y 14)
         teams = self.search_read(
             "crm.team",
@@ -124,7 +122,24 @@ class DevOdooCRMClient:
         if not members_ids:
             return None
 
-        # 2. Obtener todas las oportunidades activas en etapas específicas
+        # 2. Inicializar contador para TODOS los miembros del equipo
+        # Primero obtenemos los nombres de todos los miembros
+        users_info = self.search_read(
+            "res.users",
+            [("id", "in", members_ids)],
+            ["id", "name"],
+            limit=len(members_ids),  # Asegurar que obtenemos TODOS los miembros
+        )
+
+        # Ordenar por ID para orden determinístico
+        users_info_sorted = sorted(users_info, key=lambda u: u["id"])
+
+        opportunities_by_user = {}
+        for user in users_info_sorted:
+            opportunities_by_user[user["id"]] = {
+                "name": user["name"],
+                "count": 0,
+            }  # 3. Obtener todas las oportunidades activas en etapas específicas
         leads = self.search_read(
             "crm.lead",
             [
@@ -136,9 +151,7 @@ class DevOdooCRMClient:
             limit=None,  # Sin límite para obtener todas
         )
 
-        # 3. Contar oportunidades activas por vendedor
-        opportunities_by_user = defaultdict(int)
-
+        # 4. Contar oportunidades activas por vendedor
         for lead in leads:
             user_info = lead.get("user_id")
 
@@ -147,21 +160,19 @@ class DevOdooCRMClient:
                 continue
 
             user_id = user_info[0]
-            user_name = user_info[1]
 
-            if user_id not in opportunities_by_user:
-                opportunities_by_user[user_id] = {
-                    "name": user_name,
-                    "count": 0,
-                }
-            opportunities_by_user[user_id]["count"] += 1
+            # Incrementar el contador (ya está inicializado)
+            if user_id in opportunities_by_user:
+                opportunities_by_user[user_id]["count"] += 1
 
-        # 4. Encontrar el vendedor con menos oportunidades
+        # 5. Encontrar el vendedor con menos oportunidades
         if not opportunities_by_user:
             return None
 
+        # Usar el count como criterio principal y el user_id como desempate (menor ID gana)
         least_user_id = min(
-            opportunities_by_user, key=lambda uid: opportunities_by_user[uid]["count"]
+            opportunities_by_user,
+            key=lambda uid: (opportunities_by_user[uid]["count"], uid),
         )
 
         return least_user_id
@@ -259,7 +270,7 @@ def register(mcp, deps: dict):
             # Crear nuevo partner
             partner_values = {
                 "name": contact_name,
-                "email": email,  # Se guarda en res.partner.email
+                "email": email_normalizado,  # Se guarda en res.partner.email
                 "phone": phone,
                 "is_company": False,
                 "type": "contact",
@@ -294,7 +305,7 @@ def register(mcp, deps: dict):
             "partner_name": partner_name,
             "contact_name": contact_name,
             "phone": phone,
-            "email_from": email,
+            "email_from": email_normalizado,
             "type": "lead",  # Tipo: lead
             "partner_id": partner_id,
         }
@@ -310,15 +321,19 @@ def register(mcp, deps: dict):
         from datetime import datetime
 
         conversion_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        client.write(
-            "crm.lead",
-            lead_id,
-            {
-                "type": "opportunity",
-                "date_conversion": conversion_date,
-                "stage_id": 3,
-            },  # 3 = Oportunidad en etapa cotizacion
-        )
+
+        # Preparar valores de actualización
+        opportunity_values = {
+            "type": "opportunity",
+            "date_conversion": conversion_date,
+            "stage_id": 3,  # 3 = Oportunidad en etapa cotizacion
+        }
+
+        # Asegurar que el user_id se mantenga en la oportunidad
+        if assigned_user_id:
+            opportunity_values["user_id"] = assigned_user_id
+
+        client.write("crm.lead", lead_id, opportunity_values)
         steps["opportunity"] = (
             f"Lead convertido a oportunidad (ID: {lead_id}) - Fecha conversión: {conversion_date}"
         )
@@ -358,22 +373,45 @@ def register(mcp, deps: dict):
                 "product_uom_qty": product_qty,
             }
 
-            # Si se especifica precio manual (> 0), usarlo. Si no, obtener del producto
-            if product_price >= 0:
+            # Si se especifica precio manual (> 0), usarlo
+            if product_price > 0:
                 line_values["price_unit"] = product_price
                 steps["product_line_note"] = (
                     f"Precio manual especificado: ${product_price}"
                 )
             else:
-                # Obtener precio del producto automáticamente
-                product_data = client.read(
-                    "product.product", product_id, ["list_price", "name"]
+                # Buscar el precio en la pricelist ID 82 (Clientes Nacionales)
+                pricelist_id = 82
+                product_data = client.read("product.product", product_id, ["name"])
+                product_name = product_data.get("name", "Unknown")
+
+                # Buscar el item en la pricelist para este producto
+                pricelist_items = client.search_read(
+                    "product.pricelist.item",
+                    [
+                        ["pricelist_id", "=", pricelist_id],
+                        ["product_id", "=", product_id],
+                    ],
+                    ["fixed_price", "compute_price"],
                 )
-                line_values["price_unit"] = product_data.get("list_price", 0.0)
-                steps["product_line_note"] = (
-                    f"Precio obtenido del producto '{product_data.get('name')}': "
-                    f"${product_data.get('list_price', 0.0)}"
-                )
+
+                if pricelist_items and len(pricelist_items) > 0:
+                    # Usar el precio del pricelist
+                    pricelist_price = pricelist_items[0].get("fixed_price", 0.0)
+                    line_values["price_unit"] = pricelist_price
+                    steps["product_line_note"] = (
+                        f"Precio obtenido del Pricelist (ID: {pricelist_id}) para '{product_name}': ${pricelist_price}"
+                    )
+                else:
+                    # Si no está en el pricelist, usar list_price como fallback
+                    product_data_full = client.read(
+                        "product.product", product_id, ["list_price"]
+                    )
+                    auto_price = product_data_full.get("list_price", 0.0)
+                    line_values["price_unit"] = auto_price
+                    steps["product_line_note"] = (
+                        f"Precio obtenido del producto '{product_name}' (no encontrado en pricelist): ${auto_price}"
+                    )
 
             line_id = client.create("sale.order.line", line_values)
             steps["product_line"] = f"Línea de producto agregada (ID: {line_id})"

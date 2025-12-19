@@ -212,14 +212,14 @@ def search_partner_by_email(type, email):
         return
 
     env = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
-
+    email_lower = email.lower()
     partners = env.execute_kw(
         db,
         uid,
         password,
         "res.partner",
         "search_read",
-        [[("email", "=", email)]],
+        [[("email", "=", email_lower)]],
         {
             "fields": [
                 "id",
@@ -371,15 +371,215 @@ def get_sales_team_member_ids(env_type: str, team_name) -> list[int]:
     member_ids = teams[0].get("member_ids", [])
 
 
+def validate_pricelist(env="dev", pricelist_id=82):
+    """
+    Valida el modelo product.pricelist y muestra los items de precios configurados.
+
+    Args:
+        env: "prod" o "dev"
+        pricelist_id: ID de la lista de precios (default: 82)
+    """
+    if env == "prod":
+        url = "https://pegasuscontrol.odoo.com"
+        db = "pegasuscontrol-pegasuscontrol-10820611"
+        username = "laria@pegasus.com.mx"
+        password = "Pegasus2024."
+        api_key = "Pegasus2024."
+    else:
+        url = "https://pegasuscontrol-dev18-25468489.dev.odoo.com"
+        db = "pegasuscontrol-dev18-25468489"
+        username = "laria@pegasus.com.mx"
+        password = "Pegasus2024."
+        api_key = "Pegasus2024."
+
+    print(f"\n{'='*100}")
+    print(f"VALIDANDO PRICELIST - Ambiente: {env.upper()}")
+    print(f"{'='*100}\n")
+
+    common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common", allow_none=True)
+    # Usar api_key si es dev, password si es prod
+    auth = api_key if env == "dev" else password
+    uid = common.authenticate(db, username, auth, {})
+
+    if not uid:
+        print("❌ Authentication failed")
+        return
+
+    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object", allow_none=True)
+
+    # Leer la pricelist
+    pricelist = models.execute_kw(
+        db,
+        uid,
+        auth,
+        "product.pricelist",
+        "read",
+        [[pricelist_id]],
+        {
+            "fields": [
+                "id",
+                "name",
+                "active",
+                "currency_id",
+                "item_ids",
+                "company_id",
+            ]
+        },
+    )
+
+    if not pricelist:
+        print(f"❌ No se encontró pricelist con ID {pricelist_id}")
+        return
+
+    pricelist = pricelist[0]
+    print(f"📋 Pricelist encontrada:")
+    print(f"   ID: {pricelist['id']}")
+    print(f"   Nombre: {pricelist['name']}")
+    print(f"   Activa: {pricelist['active']}")
+    print(f"   Moneda: {pricelist.get('currency_id', 'N/A')}")
+    print(f"   Política de descuento: {pricelist.get('discount_policy', 'N/A')}")
+    print(f"   Compañía: {pricelist.get('company_id', 'N/A')}")
+
+    item_ids = pricelist.get("item_ids", [])
+    print(f"\n📦 Cantidad de items configurados: {len(item_ids)}")
+
+    if item_ids:
+        print(f"\n{'='*100}")
+        print("ITEMS DE PRECIOS (primeros 20)")
+        print(f"{'='*100}\n")
+
+        # Leer los primeros 20 items para no saturar
+        items = models.execute_kw(
+            db,
+            uid,
+            auth,
+            "product.pricelist.item",
+            "read",
+            [item_ids[:20]],
+            {
+                "fields": [
+                    "id",
+                    "product_tmpl_id",
+                    "product_id",
+                    "min_quantity",
+                    "fixed_price",
+                    "percent_price",
+                    "price_discount",
+                    "price_surcharge",
+                    "compute_price",
+                    "applied_on",
+                ]
+            },
+        )
+
+        print(
+            f"{'ID':<8} {'Tipo':<20} {'Producto':<40} {'Precio Fijo':<15} {'% Desc':<10}"
+        )
+        print("-" * 100)
+
+        for item in items:
+            item_id = item["id"]
+            applied_on = item.get("applied_on", "N/A")
+            compute_price = item.get("compute_price", "N/A")
+
+            # Determinar el producto
+            product_name = "N/A"
+            if item.get("product_id"):
+                product_name = (
+                    item["product_id"][1]
+                    if isinstance(item["product_id"], list)
+                    else str(item["product_id"])
+                )
+            elif item.get("product_tmpl_id"):
+                product_name = (
+                    item["product_tmpl_id"][1]
+                    if isinstance(item["product_tmpl_id"], list)
+                    else str(item["product_tmpl_id"])
+                )
+
+            fixed_price = item.get("fixed_price", 0)
+            percent_price = item.get("percent_price", 0)
+            price_discount = item.get("price_discount", 0)
+
+            print(
+                f"{item_id:<8} {compute_price:<20} {product_name[:38]:<40} ${fixed_price:<14.2f} {price_discount:<10.1f}"
+            )
+
+        print("-" * 100)
+
+        # Buscar robots específicamente
+        print(f"\n{'='*100}")
+        print("BUSCANDO ITEMS DE ROBOTS EN LA PRICELIST")
+        print(f"{'='*100}\n")
+
+        robot_items = []
+        for item_id in item_ids:
+            item = models.execute_kw(
+                db,
+                uid,
+                auth,
+                "product.pricelist.item",
+                "read",
+                [[item_id]],
+                {"fields": ["id", "product_id", "fixed_price", "compute_price"]},
+            )[0]
+
+            if item.get("product_id"):
+                product_id = (
+                    item["product_id"][0]
+                    if isinstance(item["product_id"], list)
+                    else item["product_id"]
+                )
+                product_name = (
+                    item["product_id"][1]
+                    if isinstance(item["product_id"], list)
+                    else "N/A"
+                )
+
+                # Filtrar robots
+                if any(
+                    keyword in product_name.lower()
+                    for keyword in ["robot", "cc1", "swiftbot", "pudu", "kettybot"]
+                ):
+                    robot_items.append(
+                        {
+                            "id": item["id"],
+                            "product_id": product_id,
+                            "product_name": product_name,
+                            "fixed_price": item.get("fixed_price", 0),
+                            "compute_price": item.get("compute_price", "N/A"),
+                        }
+                    )
+
+        if robot_items:
+            print(f"✅ Encontrados {len(robot_items)} robots en la pricelist:\n")
+            print(
+                f"{'Item ID':<10} {'Producto ID':<12} {'Precio':<15} {'Producto':<50}"
+            )
+            print("-" * 100)
+            for robot in robot_items:
+                print(
+                    f"{robot['id']:<10} {robot['product_id']:<12} ${robot['fixed_price']:<14.2f} {robot['product_name'][:48]}"
+                )
+            print("-" * 100)
+        else:
+            print("⚠️ No se encontraron robots en la pricelist")
+
+    print(f"\n{'='*100}\n")
+
+
 if __name__ == "__main__":
 
     # reparaciones()
     # field_by_id_sale_order()
-    field_by_id_leads("dev", 27351)
-    print("\n***********************************************************************\n")
-    search_partner_by_email("dev", "Ricardo@Recolino.com.mx")
+    search_partner_by_email("dev", "Sofia@gmail.com")
     print(
         "\n*******************************menos oportunidades****************************************\n"
     )
     get_salesperson_with_least_opportunities("dev")
+    field_by_id_leads("dev", 27385)
+    print("\n***********************************************************************\n")
     # get_sales_team_member_ids("dev", "Ventas")
+
+    # Validar pricelist
+    # validate_pricelist("dev", 82)
