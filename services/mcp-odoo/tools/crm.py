@@ -200,7 +200,7 @@ def register(mcp, deps: dict):
 
     @mcp.tool(
         name="dev_create_quotation",
-        description="Crea una cotización completa en desarrollo: verifica/crea partner → asigna vendedor por balanceo de carga → crea lead → convierte a oportunidad → genera cotización",
+        description="Crea una cotización completa de forma ASÍNCRONA con tracking y logging S3. Retorna tracking_id para consultar estado después. Para obtener el resultado completo, usar dev_get_quotation_status con el tracking_id retornado.",
     )
     def dev_create_quotation(
         partner_name: str,
@@ -212,218 +212,358 @@ def register(mcp, deps: dict):
         product_id: int = 0,
         product_qty: float = 1.0,
         product_price: float = -1.0,
-    ) -> QuotationResult:
+    ) -> dict:
         """
-        Crea una cotización completa siguiendo el flujo de ventas de Odoo.
+        Crea una cotización de forma ASÍNCRONA usando la infraestructura de FastAPI.
 
-        Flujo:
+        NUEVO COMPORTAMIENTO:
+        - Crea tarea en TaskManager
+        - Ejecuta proceso en background
+        - Registra logs en JSON + S3
+        - Retorna tracking_id inmediatamente
+        - LLM puede consultar estado con dev_get_quotation_status()
+
+        Flujo completo (ejecutado en background):
         1. Verifica si existe el partner (res.partner) por email, si no existe lo crea
-           - Búsqueda EXACTA por campo 'email' en res.partner
-           - Si existe: reutiliza el partner
-           - Si NO existe: crea nuevo partner con los datos proporcionados
-        1.5. Asigna vendedor (user_id) automáticamente si no se especifica
-           - Aplica balanceo de carga: asigna al vendedor con menos oportunidades activas
-           - Excluye oportunidades ganadas y perdidas del conteo
-        2. Crea un lead (crm.lead) tipo 'lead' con email_from
-        3. Convierte el lead a oportunidad (type='opportunity')
-        4. Genera una cotización/orden de venta asociada a la oportunidad
+        2. Asigna vendedor automáticamente si no se especifica (balanceo de carga)
+        3. Crea un lead (crm.lead) tipo 'lead'
+        4. Convierte el lead a oportunidad
+        5. Genera cotización/orden de venta
+        6. Agrega línea de producto (si se especifica)
 
         Args:
             partner_name: Nombre del cliente/empresa
             contact_name: Nombre del contacto
-            email: Email del contacto (se busca en res.partner.email y se guarda en crm.lead.email_from)
+            email: Email del contacto
             phone: Teléfono del contacto
-            lead_name: Nombre del lead/oportunidad (ej: "Cotización Robot Limpieza")
-            user_id: ID del vendedor (res.users), 0 = asignación automática por balanceo de carga
-            product_id: ID del producto a cotizar, 0 = sin producto
-            product_qty: Cantidad del producto, default 1.0
-            product_price: Precio unitario manual, -1.0 = obtiene automáticamente el precio del producto
+            lead_name: Nombre del lead/oportunidad
+            user_id: ID del vendedor (0 = asignación automática)
+            product_id: ID del producto (0 = sin producto)
+            product_qty: Cantidad del producto
+            product_price: Precio manual (-1.0 = automático)
 
         Returns:
-            QuotationResult con los IDs de todos los registros creados
+            dict con tracking_id, status, message, estimated_time
 
-        Nota:
-            - La búsqueda de partners es por email EXACTO (no parcial)
-            - El email se guarda como 'email' en res.partner y como 'email_from' en crm.lead
-        """
-        client = get_dev_client()
-        steps = {}
-
-        # PASO 1: Verificar/Crear Partner (res.partner)
-        # Buscar partner existente por email (el campo en res.partner es 'email')
-        # pero usamos el valor que viene en el parámetro 'email' que se guardará como 'email_from' en el lead
-        email_normalizado = email.strip().lower()
-        existing_partners = client.search_read(
-            "res.partner",
-            [("email", "=", email_normalizado)],  # Busca en res.partner.email
-            ["id", "name", "email", "phone"],
-            limit=1,
-        )
-
-        if existing_partners:
-            partner_id = existing_partners[0]["id"]
-            partner_full_name = existing_partners[0]["name"]
-            steps["partner"] = (
-                f"✓ Partner existente encontrado por email '{email}': {partner_full_name} (ID: {partner_id})"
-            )
-        else:
-            # Crear nuevo partner
-            partner_values = {
-                "name": contact_name,
-                "email": email_normalizado,  # Se guarda en res.partner.email
-                "phone": phone,
-                "is_company": False,
-                "type": "contact",
+        Ejemplo retorno:
+            {
+                "tracking_id": "quot_abc123",
+                "status": "queued",
+                "message": "Cotización creada en cola de procesamiento",
+                "estimated_time": "20-30 segundos",
+                "info": "Usa dev_get_quotation_status(tracking_id) para consultar estado"
             }
-            partner_id = client.create("res.partner", partner_values)
-            partner_full_name = partner_name
-            steps["partner"] = (
-                f"✓ Nuevo partner creado con email '{email}': {partner_full_name} (ID: {partner_id})"
-            )
+        """
+        import uuid
+        import threading
 
-        # PASO 1.5: Asignar vendedor si no se especificó
-        assigned_user_id = user_id
-        if not assigned_user_id:
-            # Aplicar balanceo de carga: asignar al vendedor con menos oportunidades activas
-            assigned_user_id = client.get_salesperson_with_least_opportunities()
-            if assigned_user_id:
-                steps["user_assignment"] = (
-                    f"✓ Vendedor asignado automáticamente por balanceo de carga (ID: {assigned_user_id})"
-                )
-            else:
-                steps["user_assignment"] = (
-                    "⚠️ No se pudo asignar vendedor automáticamente (no hay usuarios disponibles)"
-                )
-        else:
-            steps["user_assignment"] = (
-                f"✓ Vendedor especificado manualmente (ID: {assigned_user_id})"
-            )
+        # Importar TaskManager y Logger
+        from core.tasks import task_manager
+        from core.logger import quotation_logger
 
-        # PASO 2: Crear Lead (crm.lead) tipo 'lead'
-        lead_values = {
-            "name": lead_name,
+        # Generar tracking_id único
+        tracking_id = f"quot_{uuid.uuid4().hex[:12]}"
+
+        # Preparar parámetros
+        params = {
             "partner_name": partner_name,
             "contact_name": contact_name,
+            "email": email,
             "phone": phone,
-            "email_from": email_normalizado,
-            "type": "lead",  # Tipo: lead
-            "partner_id": partner_id,
+            "lead_name": lead_name,
+            "user_id": user_id,
+            "product_id": product_id,
+            "product_qty": product_qty,
+            "product_price": product_price,
         }
 
-        if assigned_user_id:
-            lead_values["user_id"] = assigned_user_id
+        # Crear tarea en TaskManager
+        task_manager.create_task(tracking_id, params)
 
-        lead_id = client.create("crm.lead", lead_values)
-        steps["lead"] = f"Lead creado: {lead_name} (ID: {lead_id})"
-
-        # PASO 3: Convertir Lead a Oportunidad
-        # Actualizar el lead a tipo 'opportunity' y establecer date_conversion
-        from datetime import datetime
-
-        conversion_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        # Preparar valores de actualización
-        opportunity_values = {
-            "type": "opportunity",
-            "date_conversion": conversion_date,
-            "stage_id": 3,  # 3 = Oportunidad en etapa cotizacion
-        }
-
-        # Asegurar que el user_id se mantenga en la oportunidad
-        if assigned_user_id:
-            opportunity_values["user_id"] = assigned_user_id
-
-        client.write("crm.lead", lead_id, opportunity_values)
-        steps["opportunity"] = (
-            f"Lead convertido a oportunidad (ID: {lead_id}) - Fecha conversión: {conversion_date}"
+        # Log inicial
+        quotation_logger.log_quotation(
+            tracking_id=tracking_id, input_data=params, status="started"
         )
 
-        # Leer el lead actualizado para obtener date_conversion
-        lead_data = client.read(
-            "crm.lead", lead_id, ["name", "date_conversion", "partner_id"]
-        )
+        # Lanzar proceso en background (thread separado)
+        def execute_quotation_background():
+            """Ejecuta el proceso completo en background"""
+            task = task_manager.get_task(tracking_id)
+            if not task:
+                return
 
-        # PASO 4: Generar Cotización (sale.order)
-        # Crear orden de venta asociada a la oportunidad
-        sale_values = {
-            "partner_id": partner_id,
-            "opportunity_id": lead_id,  # Asociar con la oportunidad
-            "origin": lead_name,  # Referencia al origen
-            "note": f"<p>Cotización generada desde oportunidad: {lead_name}</p>",
-        }
+            try:
+                task.start()
+                task.update_progress("Iniciando cliente Odoo...")
 
-        if assigned_user_id:
-            sale_values["user_id"] = assigned_user_id
+                client = get_dev_client()
+                steps = {}
 
-        sale_order_id = client.create("sale.order", sale_values)
-
-        # Leer la orden creada para obtener el nombre
-        sale_data = client.read("sale.order", sale_order_id, ["name"])
-        sale_order_name = sale_data.get("name", f"S{sale_order_id}")
-
-        steps["sale_order"] = (
-            f"Cotización creada: {sale_order_name} (ID: {sale_order_id})"
-        )
-
-        # PASO 5 (Opcional): Agregar línea de producto si se especificó
-        if product_id > 0:
-            line_values = {
-                "order_id": sale_order_id,
-                "product_id": product_id,
-                "product_uom_qty": product_qty,
-            }
-
-            # Si se especifica precio manual (> 0), usarlo
-            if product_price > 0:
-                line_values["price_unit"] = product_price
-                steps["product_line_note"] = (
-                    f"Precio manual especificado: ${product_price}"
-                )
-            else:
-                # Buscar el precio en la pricelist ID 82 (Clientes Nacionales)
-                pricelist_id = 82
-                product_data = client.read("product.product", product_id, ["name"])
-                product_name = product_data.get("name", "Unknown")
-
-                # Buscar el item en la pricelist para este producto
-                pricelist_items = client.search_read(
-                    "product.pricelist.item",
-                    [
-                        ["pricelist_id", "=", pricelist_id],
-                        ["product_id", "=", product_id],
-                    ],
-                    ["fixed_price", "compute_price"],
+                # PASO 1: Verificar/Crear Partner
+                task.update_progress("Verificando partner...")
+                email_normalizado = email.strip().lower()
+                existing_partners = client.search_read(
+                    "res.partner",
+                    [("email", "=", email_normalizado)],
+                    ["id", "name", "email", "phone"],
+                    limit=1,
                 )
 
-                if pricelist_items and len(pricelist_items) > 0:
-                    # Usar el precio del pricelist
-                    pricelist_price = pricelist_items[0].get("fixed_price", 0.0)
-                    line_values["price_unit"] = pricelist_price
-                    steps["product_line_note"] = (
-                        f"Precio obtenido del Pricelist (ID: {pricelist_id}) para '{product_name}': ${pricelist_price}"
+                if existing_partners:
+                    partner_id = existing_partners[0]["id"]
+                    partner_full_name = existing_partners[0]["name"]
+                    steps["partner"] = (
+                        f"Partner existente: {partner_full_name} (ID: {partner_id})"
                     )
                 else:
-                    # Si no está en el pricelist, usar list_price como fallback
-                    product_data_full = client.read(
-                        "product.product", product_id, ["list_price"]
-                    )
-                    auto_price = product_data_full.get("list_price", 0.0)
-                    line_values["price_unit"] = auto_price
-                    steps["product_line_note"] = (
-                        f"Precio obtenido del producto '{product_name}' (no encontrado en pricelist): ${auto_price}"
+                    partner_values = {
+                        "name": contact_name,
+                        "email": email_normalizado,
+                        "phone": phone,
+                        "is_company": False,
+                        "type": "contact",
+                    }
+                    partner_id = client.create("res.partner", partner_values)
+                    partner_full_name = partner_name
+                    steps["partner"] = (
+                        f"Nuevo partner creado: {partner_full_name} (ID: {partner_id})"
                     )
 
-            line_id = client.create("sale.order.line", line_values)
-            steps["product_line"] = f"Línea de producto agregada (ID: {line_id})"
+                task.update_progress("Partner verificado")
 
-        return QuotationResult(
-            partner_id=partner_id,
-            partner_name=partner_full_name,
-            lead_id=lead_id,
-            lead_name=lead_name,
-            opportunity_id=lead_id,  # El ID es el mismo (lead → opportunity)
-            opportunity_name=lead_data.get("name", lead_name),
-            sale_order_id=sale_order_id,
-            sale_order_name=sale_order_name,
-            steps=steps,
-        )
+                # PASO 2: Asignar vendedor
+                task.update_progress("Asignando vendedor...")
+                assigned_user_id = user_id
+                if not assigned_user_id:
+                    assigned_user_id = client.get_salesperson_with_least_opportunities()
+                    if assigned_user_id:
+                        steps["user"] = (
+                            f"Vendedor asignado automáticamente (ID: {assigned_user_id})"
+                        )
+                    else:
+                        steps["user"] = "Sin vendedor asignado"
+                else:
+                    steps["user"] = f"Vendedor manual (ID: {assigned_user_id})"
+
+                task.update_progress("Vendedor asignado")
+
+                # PASO 3: Crear Lead
+                task.update_progress("Creando lead...")
+                lead_values = {
+                    "name": lead_name,
+                    "partner_name": partner_name,
+                    "contact_name": contact_name,
+                    "phone": phone,
+                    "email_from": email_normalizado,
+                    "type": "lead",
+                    "partner_id": partner_id,
+                }
+                if assigned_user_id:
+                    lead_values["user_id"] = assigned_user_id
+
+                lead_id = client.create("crm.lead", lead_values)
+                steps["lead"] = f"Lead creado: {lead_name} (ID: {lead_id})"
+                task.update_progress("Lead creado")
+
+                # PASO 4: Convertir a Oportunidad
+                task.update_progress("Convirtiendo a oportunidad...")
+                from datetime import datetime
+
+                conversion_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                opportunity_values = {
+                    "type": "opportunity",
+                    "date_conversion": conversion_date,
+                    "stage_id": 3,
+                }
+                if assigned_user_id:
+                    opportunity_values["user_id"] = assigned_user_id
+
+                client.write("crm.lead", lead_id, opportunity_values)
+                steps["opportunity"] = f"Convertido a oportunidad (ID: {lead_id})"
+                task.update_progress("Oportunidad creada")
+
+                # PASO 5: Crear Sale Order
+                task.update_progress("Creando cotización...")
+                sale_values = {
+                    "partner_id": partner_id,
+                    "opportunity_id": lead_id,
+                    "origin": lead_name,
+                    "note": f"<p>Cotización desde oportunidad: {lead_name}</p>",
+                }
+                if assigned_user_id:
+                    sale_values["user_id"] = assigned_user_id
+
+                sale_order_id = client.create("sale.order", sale_values)
+                sale_data = client.read("sale.order", sale_order_id, ["name"])
+                sale_order_name = sale_data.get("name", f"S{sale_order_id}")
+                steps["sale_order"] = (
+                    f"Cotización: {sale_order_name} (ID: {sale_order_id})"
+                )
+                task.update_progress("Cotización creada")
+
+                # PASO 6: Agregar producto (si aplica)
+                if product_id > 0:
+                    task.update_progress("Agregando producto...")
+                    line_values = {
+                        "order_id": sale_order_id,
+                        "product_id": product_id,
+                        "product_uom_qty": product_qty,
+                    }
+
+                    if product_price > 0:
+                        line_values["price_unit"] = product_price
+                        steps["product"] = (
+                            f"Producto con precio manual: ${product_price}"
+                        )
+                    else:
+                        pricelist_id = 82
+                        product_data = client.read(
+                            "product.product", product_id, ["name"]
+                        )
+                        product_name = product_data.get("name", "Unknown")
+
+                        pricelist_items = client.search_read(
+                            "product.pricelist.item",
+                            [
+                                ["pricelist_id", "=", pricelist_id],
+                                ["product_id", "=", product_id],
+                            ],
+                            ["fixed_price"],
+                        )
+
+                        if pricelist_items:
+                            pricelist_price = pricelist_items[0].get("fixed_price", 0.0)
+                            line_values["price_unit"] = pricelist_price
+                            steps["product"] = (
+                                f"Producto '{product_name}': ${pricelist_price}"
+                            )
+                        else:
+                            product_data_full = client.read(
+                                "product.product", product_id, ["list_price"]
+                            )
+                            auto_price = product_data_full.get("list_price", 0.0)
+                            line_values["price_unit"] = auto_price
+                            steps["product"] = (
+                                f"Producto '{product_name}': ${auto_price}"
+                            )
+
+                    line_id = client.create("sale.order.line", line_values)
+                    steps["product"] += f" (línea ID: {line_id})"
+                    task.update_progress("Producto agregado")
+
+                # Resultado final
+                result = {
+                    "partner_id": partner_id,
+                    "partner_name": partner_full_name,
+                    "lead_id": lead_id,
+                    "lead_name": lead_name,
+                    "opportunity_id": lead_id,
+                    "sale_order_id": sale_order_id,
+                    "sale_order_name": sale_order_name,
+                    "steps": steps,
+                    "environment": "development",
+                }
+
+                # Marcar como completado
+                task.complete(result)
+
+                # Actualizar log
+                quotation_logger.update_quotation_log(
+                    tracking_id=tracking_id,
+                    output_data=result,
+                    status="completed",
+                    error=None,
+                )
+
+            except Exception as e:
+                # Marcar como fallido
+                error_msg = str(e)
+                task.fail(error_msg)
+
+                # Log de error
+                quotation_logger.update_quotation_log(
+                    tracking_id=tracking_id,
+                    output_data=None,
+                    status="failed",
+                    error=error_msg,
+                )
+
+        # Lanzar thread
+        thread = threading.Thread(target=execute_quotation_background, daemon=True)
+        thread.start()
+
+        # Retornar tracking_id inmediatamente
+        return {
+            "tracking_id": tracking_id,
+            "status": "queued",
+            "message": "Cotización en proceso. Usa dev_get_quotation_status() para consultar el estado.",
+            "estimated_time": "20-30 segundos",
+            "check_status_with": f"dev_get_quotation_status(tracking_id='{tracking_id}')",
+        }
+
+    @mcp.tool(
+        name="dev_get_quotation_status",
+        description="Consulta el estado de una cotización asíncrona usando su tracking_id. Retorna el estado actual (queued/processing/completed/failed) y el resultado si está disponible.",
+    )
+    def dev_get_quotation_status(tracking_id: str) -> dict:
+        """
+        Consulta el estado de una cotización creada con dev_create_quotation.
+
+        Args:
+            tracking_id: ID de seguimiento retornado por dev_create_quotation
+
+        Returns:
+            dict con status, progress, result (si completed), error (si failed)
+
+        Ejemplo retorno (en proceso):
+            {
+                "tracking_id": "quot_abc123",
+                "status": "processing",
+                "progress": "Creando lead...",
+                "created_at": "2025-12-22T10:48:40"
+            }
+
+        Ejemplo retorno (completado):
+            {
+                "tracking_id": "quot_abc123",
+                "status": "completed",
+                "result": {
+                    "partner_id": 123,
+                    "lead_id": 456,
+                    "sale_order_id": 789,
+                    "sale_order_name": "S00123",
+                    "steps": {...}
+                },
+                "created_at": "2025-12-22T10:48:40",
+                "updated_at": "2025-12-22T10:49:10"
+            }
+        """
+        from core.tasks import task_manager
+
+        task = task_manager.get_task(tracking_id)
+
+        if not task:
+            return {
+                "tracking_id": tracking_id,
+                "status": "not_found",
+                "error": f"No se encontró tarea con tracking_id: {tracking_id}",
+            }
+
+        response = {
+            "tracking_id": task.task_id,
+            "status": task.status,
+            "progress": task.progress,
+            "created_at": task.created_at.isoformat(),
+        }
+
+        if task.updated_at:
+            response["updated_at"] = task.updated_at.isoformat()
+
+        if task.status == "completed" and task.result:
+            response["result"] = task.result
+
+        if task.status == "failed" and task.error:
+            response["error"] = task.error
+
+        return response

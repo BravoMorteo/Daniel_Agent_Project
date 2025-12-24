@@ -91,6 +91,9 @@ services/mcp-odoo/GUIA_INICIO_SERVIDOR.md
 services/mcp-odoo/INDEX.md
 services/mcp-odoo/QUICK_START.md
 services/mcp-odoo/check_products.py
+services/mcp-odoo/backup.py
+services/mcp-odoo/server.backup.py
+services/mcp-odoo/core/logger.backup.py
 
 # ================
 # ServerAvatar - Librerías externas

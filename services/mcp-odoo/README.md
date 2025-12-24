@@ -1,125 +1,265 @@
-# MCP-Odoo
+# MCP-Odoo Server
 
-Servidor Model Context Protocol (MCP) para integración con Odoo ERP.
+Servidor híbrido que combina **Model Context Protocol (MCP)** y **FastAPI** para integración completa con Odoo ERP.
 
-## 🎯 Funcionalidad
+## 🎯 Características
 
-Este servidor MCP permite interactuar con Odoo ERP a través de:
-- 🔍 **Búsqueda** de proyectos, tareas, clientes, ventas
-- 📋 **Gestión de CRM** (leads, oportunidades, contactos)
-- 💼 **Gestión de Ventas** (pedidos, productos, clientes)
-- 📊 **Gestión de Proyectos** (proyectos, tareas, sprints)
-- 👥 **Gestión de Usuarios** (usuarios, permisos)
+- 🔄 **API Asíncrona** - Cotizaciones en background con FastAPI
+- 🔍 **MCP Tools** - Búsqueda y gestión de proyectos, tareas, CRM, ventas
+- � **Logging Automático** - Registro JSON de operaciones con subida a S3
+- 🐳 **Docker Ready** - Configuración lista para contenedores
+- ⚡ **Dual Protocol** - MCP para IA + REST API para clientes
+
+## 🚀 Inicio Rápido
+
+### 1. Configurar `.env`
+
+```bash
+# Odoo Producción (solo lectura)
+ODOO_URL=https://pegasuscontrol.odoo.com
+ODOO_DB=pegasuscontrol-pegasuscontrol-10820611
+ODOO_LOGIN=tu_email@ejemplo.com
+ODOO_API_KEY=tu_api_key
+
+# Odoo Desarrollo (escritura)
+DEV_ODOO_URL=https://pegasuscontrol-dev18-25468489.dev.odoo.com
+DEV_ODOO_DB=pegasuscontrol-dev18-25468489
+DEV_ODOO_LOGIN=tu_email@ejemplo.com
+DEV_ODOO_API_KEY=tu_api_key
+
+# AWS S3 para Logs
+S3_LOGS_BUCKET=ilagentslogs
+AWS_REGION=us-west-2
+
+# Server
+PORT=8000
+```
+
+### 2. Instalar y Ejecutar
+
+```bash
+# Instalar dependencias
+pip install -e .
+
+# Ejecutar servidor (unbuffered para logs en tiempo real)
+python -u server.py > /tmp/mcp_server.log 2>&1 &
+
+# Verificar
+curl http://localhost:8000/api/health
+```
+
+### 3. Usar API
+
+```bash
+# Crear cotización asíncrona
+curl -X POST http://localhost:8000/api/quotation/async \
+  -H "Content-Type: application/json" \
+  -d '{
+    "partner_name": "Company SA",
+    "contact_name": "Juan Pérez",
+    "email": "juan@company.com",
+    "phone": "+52 55 1234 5678",
+    "lead_name": "Nuevo Lead",
+    "product_id": 26174,
+    "product_qty": 1
+  }'
+
+# Respuesta: {"tracking_id": "quot_xxx", "status": "queued", ...}
+
+# Consultar estado
+curl http://localhost:8000/api/quotation/status/quot_xxx
+```
+
+## 📊 Endpoints Principales
+
+### FastAPI (Async)
+- `POST /api/quotation/async` - Crear cotización asíncrona
+- `GET /api/quotation/status/{id}` - Consultar estado
+- `GET /api/health` - Health check
+- `GET /docs` - Swagger UI
+
+### MCP Protocol
+- `POST /mcp` - Protocolo MCP para herramientas síncronas
 
 ## 📁 Estructura del Proyecto
 
 ```
 mcp-odoo/
-├── server.py                   # 🚀 Punto de entrada principal
-├── core/                       # � Módulos principales
-│   ├── __init__.py
-│   ├── config.py              # ⚙️ Configuración y variables de entorno
-│   ├── odoo_client.py         # 🔌 Cliente Odoo (XML-RPC)
-│   ├── helpers.py             # 🛠️ Funciones helper (URL, encoding, etc.)
-│   └── README.md              # Documentación del core
-├── tools/                      # 🔧 Tools modulares de MCP
-│   ├── __init__.py            # Autoload de tools
-│   ├── crm.py                 # Tools de CRM
-│   ├── projects.py            # Tools de proyectos
-│   ├── sales.py               # Tools de ventas
-│   ├── tasks.py               # Tools de tareas
-│   ├── users.py               # Tools de usuarios
-│   ├── search.py              # Tools de búsqueda
-│   └── README.md              # Documentación de tools
-├── scripts/                    # 🛠️ Scripts de deployment
-│   ├── Dockerfile             # Configuración Docker
-│   ├── Makefile               # Comandos Make
-│   ├── build.sh               # Script de build
-│   └── README.md              # Documentación de deployment
-├── README.md                  # 📖 Este archivo
-├── ARCHITECTURE.md            # 🏗️ Arquitectura detallada
-└── pyproject.toml             # 📦 Dependencias
+├── server.py              # Punto de entrada (FastMCP + FastAPI)
+├── core/                  # Módulos principales
+│   ├── config.py         # Configuración y variables de entorno
+│   ├── odoo_client.py    # Cliente Odoo XML-RPC
+│   ├── api.py            # FastAPI endpoints asíncronos
+│   ├── tasks.py          # Task manager para background jobs
+│   └── logger.py         # Sistema de logging con S3
+├── tools/                 # MCP Tools (CRM, sales, projects, etc.)
+├── docs/                  # 📚 Documentación completa
+│   ├── README.md         # Índice de documentación
+│   ├── LOGGING.md        # Sistema de logs
+│   ├── S3_LOGS_SETUP.md  # Setup AWS S3
+│   └── IMPLEMENTATION.md # Resumen de implementación
+├── examples/              # Scripts de prueba
+│   └── test_s3_logs.sh   # Demo de logging
+├── ARCHITECTURE.md        # Arquitectura detallada
+└── pyproject.toml        # Dependencias
+
 ```
 
-## 🚀 Inicio Rápido
+## 🏗️ Arquitectura
 
-### 1. Configurar Variables de Entorno
-
-Crea un archivo `.env` con:
-
-```bash
-# Odoo Configuration
-ODOO_URL=https://tu-odoo.com
-ODOO_DB=nombre_base_datos
-ODOO_LOGIN=tu_email@ejemplo.com
-ODOO_API_KEY=tu_api_key
-
-# Server Configuration (opcional)
-PORT=8000
+```
+┌─────────────────┐
+│   Clientes      │
+│  (IA/Frontend)  │
+└────────┬────────┘
+         │
+    ┌────▼─────┐
+    │  FastAPI │ ← Async API (cotizaciones)
+    │   +MCP   │ ← Sync Tools (búsqueda, lectura)
+    └────┬─────┘
+         │
+    ┌────▼─────────┐
+    │ Task Manager │ ← Background Jobs
+    └────┬─────────┘
+         │
+    ┌────▼──────┐
+    │  Logger   │ ← JSON logs → S3
+    └────┬──────┘
+         │
+    ┌────▼─────┐
+    │   Odoo   │ ← XML-RPC
+    │ Dev/Prod  │
+    └──────────┘
 ```
 
-### 2. Instalar Dependencias
+### Flujo de Cotización Asíncrona
+
+```mermaid
+sequenceDiagram
+    Cliente->>+API: POST /api/quotation/async
+    API->>Logger: Registrar inicio (status: started)
+    Logger->>S3: Subir log inicial
+    API-->>Cliente: {tracking_id, status: queued}
+    API->>+TaskManager: Encolar background task
+    TaskManager->>+Odoo: 1. Verificar/crear partner
+    Odoo-->>-TaskManager: partner_id
+    TaskManager->>+Odoo: 2. Asignar vendedor (balanceo)
+    Odoo-->>-TaskManager: user_id
+    TaskManager->>+Odoo: 3. Crear lead
+    Odoo-->>-TaskManager: lead_id
+    TaskManager->>+Odoo: 4. Convertir a oportunidad
+    Odoo-->>-TaskManager: opportunity_id
+    TaskManager->>+Odoo: 5. Crear cotización
+    Odoo-->>-TaskManager: sale_order_id
+    TaskManager->>Logger: Actualizar log (status: completed)
+    Logger->>S3: Subir log final
+    Cliente->>API: GET /api/quotation/status/{tracking_id}
+    API-->>Cliente: {status: completed, result: {...}}
+```
+
+## 📚 Documentación
+
+Toda la documentación está organizada en **[docs/](docs/)**:
+
+- **[docs/README.md](docs/README.md)** - 📑 Índice completo de documentación
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** - 🏗️ Arquitectura del sistema
+- **[docs/LOGGING.md](docs/LOGGING.md)** - 📝 Sistema de logs automático
+- **[docs/S3_LOGS_SETUP.md](docs/S3_LOGS_SETUP.md)** - ☁️ Configuración AWS S3
+
+**Ver también:** [docs/REORGANIZATION.md](docs/REORGANIZATION.md) - Guía de reorganización
+
+## 🧪 Testing
 
 ```bash
-# Con pip
+# Demo completa de logging
+./examples/test_s3_logs.sh
+
+# Health check
+curl http://localhost:8000/api/health
+
+# Ver logs del servidor
+tail -f /tmp/mcp_server.log
+
+# Ver logs de cotizaciones
+ls -lh /tmp/mcp_odoo_logs/
+cat /tmp/mcp_odoo_logs/2025-12-22_quot_xxx.log | python -m json.tool
+```
+
+## � Sistema de Logging
+
+Cada operación se registra automáticamente en JSON:
+
+```json
+{
+  "tracking_id": "quot_xxx",
+  "timestamp": "2025-12-22T10:48:40.405304",
+  "status": "completed",
+  "input": { ... },
+  "output": {
+    "partner_id": 124253,
+    "lead_id": 27409,
+    "sale_order_id": 18689,
+    "sale_order_name": "S15428"
+  },
+  "error": null
+}
+```
+
+**Ubicación:**
+- Local: `/tmp/mcp_odoo_logs/YYYY-MM-DD_tracking_id.log`
+- S3: `s3://ilagentslogs/mcp-odoo-logs/YYYY/MM/`
+
+Ver [docs/LOGGING.md](docs/LOGGING.md) para más detalles.
+
+## 🐳 Docker
+
+```bash
+# Build
+docker build -t mcp-odoo .
+
+# Run
+docker run -p 8000:8000 --env-file .env mcp-odoo
+```
+
+## 🔧 Desarrollo
+
+```bash
+# Instalar en modo desarrollo
 pip install -e .
 
-# O con uv (recomendado)
-uv pip install -e .
+# Ejecutar con recarga automática
+uvicorn server:app --reload --port 8000
+
+# Ver logs en tiempo real
+tail -f /tmp/mcp_server.log | grep -E "Log guardado|subido a S3"
 ```
 
-### 3. Ejecutar Servidor
+## 📦 Dependencias
 
-```bash
-python server.py
-```
+- **fastapi** - Framework web asíncrono
+- **uvicorn** - Servidor ASGI
+- **mcp** - Model Context Protocol SDK
+- **boto3** - AWS SDK para subida de logs
+- **pydantic** - Validación de datos
+- **python-dotenv** - Manejo de variables de entorno
 
-El servidor estará disponible en: `http://localhost:8000`
+## 🤝 Contribuir
 
-## 🔧 Componentes Principales
+1. Lee [ARCHITECTURE.md](ARCHITECTURE.md) para entender el diseño
+2. Consulta [docs/](docs/) para guías específicas
+3. Crea tus cambios en una branch
+4. Asegúrate de que los tests pasen
+5. Crea un Pull Request
 
-### `core/config.py`
-Maneja toda la configuración del servidor:
-- Carga variables de entorno desde `.env`
-- Valida configuración requerida
-- Expone constantes de configuración
+## 📄 Licencia
 
-### `core/odoo_client.py`
-Cliente XML-RPC para Odoo con métodos CRUD:
-- `search()` - Buscar registros
-- `search_read()` - Buscar y leer campos
-- `read()` - Leer campos de registros
-- `create()` - Crear registros
-- `write()` - Actualizar registros
-- `unlink()` - Eliminar registros
+MIT
 
-### `core/helpers.py`
-Funciones de utilidad:
-- `encode_content()` - Formatea respuestas MCP
-- `odoo_form_url()` - Genera URLs de formularios Odoo
-- `wants_projects()` / `wants_tasks()` - Detecta intención de búsqueda
+## 🔗 Links
 
-### `tools/`
-Cada archivo en `tools/` define un conjunto de herramientas MCP:
+- **API Docs:** http://localhost:8000/docs
+- **Repo:** https://github.com/BravoMorteo/Daniel_Agent_Project
 
-#### `search.py`
-- `search` - Busca proyectos y tareas
-- `fetch` - Recupera detalles completos
-
-#### `crm.py`
-- Tools de gestión de CRM (leads, oportunidades)
-
-#### `projects.py`
-- Tools de gestión de proyectos
-
-#### `sales.py`
-- Tools de gestión de ventas
-
-#### `tasks.py`
-- Tools de gestión de tareas
-
-#### `users.py`
-- Tools de gestión de usuarios
 
 ## 🔄 Flujo de Datos
 
