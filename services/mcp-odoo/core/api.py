@@ -6,41 +6,107 @@ Endpoints para crear cotizaciones en background y consultar su estado.
 import uuid
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-from typing import Optional
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional, List
 
 from core.tasks import task_manager, QuotationTask
 from core.logger import quotation_logger
+from core.helpers import retry_on_network_error
 from tools.crm import DevOdooCRMClient
 
 
 # Modelos Pydantic para validación
+class ProductLine(BaseModel):
+    """Modelo para una línea de producto"""
+
+    product_id: int = Field(..., gt=0, description="ID del producto en Odoo")
+    qty: float = Field(1.0, gt=0, description="Cantidad del producto")
+    price: float = Field(-1.0, description="Precio unitario (-1 = usar pricelist)")
+
+    class Config:
+        json_schema_extra = {
+            "example": {"product_id": 26174, "qty": 2.0, "price": -1.0}
+        }
+
+
 class QuotationRequest(BaseModel):
-    """Modelo para solicitud de cotización"""
+    """Modelo para solicitud de cotización con soporte para múltiples productos"""
 
     partner_name: str = Field(..., description="Nombre de la empresa/cliente")
     contact_name: str = Field(..., description="Nombre del contacto")
     email: str = Field(..., description="Email del contacto")
     phone: str = Field(..., description="Teléfono del contacto")
     lead_name: str = Field(..., description="Nombre/descripción del lead")
-    product_id: int = Field(0, ge=0, description="ID del producto (0 = sin producto)")
-    product_qty: int = Field(1, ge=1, description="Cantidad del producto")
-    product_price: float = Field(-1, description="Precio manual (-1 = usar pricelist)")
+
+    # NUEVO: Array de productos (para múltiples productos diferentes)
+    products: Optional[List[ProductLine]] = Field(
+        None, description="Lista de productos a agregar (formato nuevo)"
+    )
+
+    # MANTENER: Campos legacy (para compatibilidad hacia atrás)
+    product_id: Optional[int] = Field(
+        0, ge=0, description="ID del producto (formato legacy, 0 = sin producto)"
+    )
+    product_qty: Optional[float] = Field(
+        1, gt=0, description="Cantidad del producto (formato legacy)"
+    )
+    product_price: Optional[float] = Field(
+        -1, description="Precio manual (formato legacy, -1 = usar pricelist)"
+    )
+
     user_id: int = Field(
         0, ge=0, description="ID del vendedor (0 = balanceo automático)"
     )
 
+    # NUEVOS CAMPOS ADICIONALES
+    description: Optional[str] = Field(
+        None, description="Descripción adicional del lead/cotización"
+    )
+    x_studio_producto: Optional[int] = Field(
+        None, description="Campo custom de Odoo - ID del producto principal (entero)"
+    )
+
+    @field_validator("products")
+    @classmethod
+    def validate_products(cls, v, info):
+        """Validar que al menos un método de agregar productos esté presente"""
+        # Si viene products, debe tener al menos un elemento
+        if v is not None and len(v) == 0:
+            raise ValueError(
+                "Si se especifica 'products', debe contener al menos un producto"
+            )
+        return v
+
     class Config:
         json_schema_extra = {
-            "example": {
-                "partner_name": "Almacenes Torres",
-                "contact_name": "Luis Fernández",
-                "email": "luis@almacenes.com",
-                "phone": "+521234567890",
-                "lead_name": "Cotización Robot PUDU",
-                "product_id": 26174,
-                "product_qty": 2,
-            }
+            "examples": [
+                {
+                    "description": "Formato simple (legacy) - Un solo producto",
+                    "value": {
+                        "partner_name": "Almacenes Torres",
+                        "contact_name": "Luis Fernández",
+                        "email": "luis@almacenes.com",
+                        "phone": "+521234567890",
+                        "lead_name": "Cotización Robot PUDU",
+                        "product_id": 26174,
+                        "product_qty": 2,
+                    },
+                },
+                {
+                    "description": "Formato múltiple (nuevo) - Varios productos diferentes",
+                    "value": {
+                        "partner_name": "Almacenes Torres",
+                        "contact_name": "Luis Fernández",
+                        "email": "luis@almacenes.com",
+                        "phone": "+521234567890",
+                        "lead_name": "Cotización Robots Mix",
+                        "products": [
+                            {"product_id": 26174, "qty": 2, "price": -1},
+                            {"product_id": 26175, "qty": 1, "price": -1},
+                        ],
+                    },
+                },
+            ]
         }
 
 
@@ -64,7 +130,7 @@ api_app = FastAPI(
 
 def process_quotation_background(task_id: str, params: dict):
     """
-    Procesa una cotización en background.
+    Procesa una cotización en background con reintentos automáticos.
     Esta función se ejecuta en un thread separado.
     """
     task = task_manager.get_task(task_id)
@@ -76,7 +142,12 @@ def process_quotation_background(task_id: str, params: dict):
         tracking_id=task_id, input_data=params, status="started"
     )
 
-    try:
+    # Función interna que contiene toda la lógica de Odoo
+    # Se aplicará el decorador de reintentos a esta función
+    @retry_on_network_error(max_attempts=3, base_delay=2.0, backoff_factor=2.5)
+    def execute_odoo_operations():
+        """Ejecuta todas las operaciones de Odoo con reintentos automáticos"""
+
         # Marcar como en proceso
         task.start()
         task.update_progress("Iniciando cliente Odoo...")
@@ -130,6 +201,21 @@ def process_quotation_background(task_id: str, params: dict):
             "partner_id": partner_id,
         }
 
+        # Agregar descripción si existe
+        if params.get("description"):
+            lead_values["description"] = params["description"]
+
+        # Agregar campo custom x_studio_producto
+        # Si no se especifica, tomar el primer producto del array o el product_id legacy
+        if params.get("x_studio_producto"):
+            lead_values["x_studio_producto"] = params["x_studio_producto"]
+        elif params.get("products") and len(params["products"]) > 0:
+            # Auto-asignar el primer producto del array
+            lead_values["x_studio_producto"] = params["products"][0]["product_id"]
+        elif params.get("product_id", 0) > 0:
+            # Usar el product_id legacy
+            lead_values["x_studio_producto"] = params["product_id"]
+
         if assigned_user_id:
             lead_values["user_id"] = assigned_user_id
 
@@ -171,14 +257,37 @@ def process_quotation_background(task_id: str, params: dict):
 
         task.update_progress("Cotización creada")
 
-        # Agregar línea de producto si se especificó
-        product_line_note = None
-        if params.get("product_id", 0) > 0:
-            task.update_progress("Agregando producto...")
+        # Determinar qué productos agregar (nuevo formato vs legacy)
+        products_to_add = []
 
-            product_id = params["product_id"]
-            product_qty = params.get("product_qty", 1)
-            product_price = params.get("product_price", -1)
+        if params.get("products"):
+            # Formato nuevo: array de productos
+            task.update_progress(f"Agregando {len(params['products'])} producto(s)...")
+            products_to_add = [
+                {
+                    "product_id": p["product_id"],
+                    "qty": p.get("qty", 1.0),
+                    "price": p.get("price", -1.0),
+                }
+                for p in params["products"]
+            ]
+        elif params.get("product_id", 0) > 0:
+            # Formato legacy: un solo producto
+            task.update_progress("Agregando producto...")
+            products_to_add = [
+                {
+                    "product_id": params["product_id"],
+                    "qty": params.get("product_qty", 1),
+                    "price": params.get("product_price", -1),
+                }
+            ]
+
+        # Agregar líneas de producto
+        product_lines_info = []
+        for idx, product_data in enumerate(products_to_add, 1):
+            product_id = product_data["product_id"]
+            product_qty = product_data["qty"]
+            product_price = product_data["price"]
 
             line_values = {
                 "order_id": sale_order_id,
@@ -203,37 +312,76 @@ def process_quotation_background(task_id: str, params: dict):
                         else "Unknown"
                     )
                     line_values["price_unit"] = price
-                    product_line_note = (
-                        f"Precio del Pricelist para '{product_name}': ${price}"
+                    product_lines_info.append(
+                        {
+                            "product_id": product_id,
+                            "product_name": product_name,
+                            "qty": product_qty,
+                            "price": price,
+                            "source": "pricelist",
+                        }
                     )
                 else:
-                    product_data = client.read(
+                    product_data_read = client.read(
                         "product.product", product_id, ["list_price", "name"]
                     )
-                    price = product_data.get("list_price", 0.0)
-                    product_name = product_data.get("name", "Unknown")
+                    price = product_data_read.get("list_price", 0.0)
+                    product_name = product_data_read.get("name", "Unknown")
                     line_values["price_unit"] = price
-                    product_line_note = (
-                        f"Precio del producto '{product_name}': ${price}"
+                    product_lines_info.append(
+                        {
+                            "product_id": product_id,
+                            "product_name": product_name,
+                            "qty": product_qty,
+                            "price": price,
+                            "source": "product",
+                        }
                     )
             else:
+                # Precio manual
                 line_values["price_unit"] = product_price
-                product_line_note = f"Precio manual: ${product_price}"
+                # Obtener nombre del producto para el log
+                product_data_read = client.read("product.product", product_id, ["name"])
+                product_name = product_data_read.get("name", "Unknown")
+                product_lines_info.append(
+                    {
+                        "product_id": product_id,
+                        "product_name": product_name,
+                        "qty": product_qty,
+                        "price": product_price,
+                        "source": "manual",
+                    }
+                )
 
             client.create("sale.order.line", line_values)
-            task.update_progress("Producto agregado")
 
-        # Completar tarea con resultado
-        result = {
+            if len(products_to_add) > 1:
+                task.update_progress(f"Producto {idx}/{len(products_to_add)} agregado")
+
+        if products_to_add:
+            task.update_progress(f"✓ {len(products_to_add)} producto(s) agregado(s)")
+
+        # Retornar resultado
+        return {
             "partner_id": partner_id,
             "lead_id": lead_id,
             "opportunity_id": lead_id,
             "sale_order_id": sale_order_id,
             "sale_order_name": sale_order_name,
             "user_id": assigned_user_id,
-            "product_line_note": product_line_note,
+            "products_added": product_lines_info,  # Nueva info detallada
+            "product_line_note": (  # Legacy compatibility
+                f"{len(product_lines_info)} producto(s) agregado(s)"
+                if product_lines_info
+                else None
+            ),
         }
 
+    try:
+        # Ejecutar operaciones de Odoo con reintentos automáticos
+        result = execute_odoo_operations()
+
+        # Completar tarea con resultado
         task.complete(result)
 
         # Registrar resultado exitoso en log

@@ -3,9 +3,10 @@
 DESARROLLO (Lectura y Escritura):
 - dev_create_quotation: Crea un flujo completo: partner → lead → oportunidad → cotización
 """
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from pydantic import BaseModel
 import os
+from core.tasks import TaskStatus
 
 
 class QuotationResult(BaseModel):
@@ -212,6 +213,9 @@ def register(mcp, deps: dict):
         product_id: int = 0,
         product_qty: float = 1.0,
         product_price: float = -1.0,
+        products: Optional[List[dict]] = None,
+        description: Optional[str] = None,
+        x_studio_producto: Optional[int] = None,
     ) -> dict:
         """
         Crea una cotización de forma ASÍNCRONA usando la infraestructura de FastAPI.
@@ -222,14 +226,15 @@ def register(mcp, deps: dict):
         - Registra logs en JSON + S3
         - Retorna tracking_id inmediatamente
         - LLM puede consultar estado con dev_get_quotation_status()
+        - Soporta múltiples productos mediante el parámetro 'products'
 
         Flujo completo (ejecutado en background):
         1. Verifica si existe el partner (res.partner) por email, si no existe lo crea
         2. Asigna vendedor automáticamente si no se especifica (balanceo de carga)
-        3. Crea un lead (crm.lead) tipo 'lead'
+        3. Crea un lead (crm.lead) tipo 'lead' con campos personalizados
         4. Convierte el lead a oportunidad
         5. Genera cotización/orden de venta
-        6. Agrega línea de producto (si se especifica)
+        6. Agrega líneas de productos (soporta múltiples productos)
 
         Args:
             partner_name: Nombre del cliente/empresa
@@ -238,9 +243,12 @@ def register(mcp, deps: dict):
             phone: Teléfono del contacto
             lead_name: Nombre del lead/oportunidad
             user_id: ID del vendedor (0 = asignación automática)
-            product_id: ID del producto (0 = sin producto)
-            product_qty: Cantidad del producto
-            product_price: Precio manual (-1.0 = automático)
+            product_id: ID del producto (0 = sin producto) [LEGACY - usar 'products']
+            product_qty: Cantidad del producto [LEGACY - usar 'products']
+            product_price: Precio manual (-1.0 = automático) [LEGACY - usar 'products']
+            products: Lista de productos con formato [{"product_id": int, "qty": float, "price": float}]
+            description: Descripción personalizada para el lead
+            x_studio_producto: ID del producto principal (Many2one). Si se omite, se asigna automáticamente el primer producto
 
         Returns:
             dict con tracking_id, status, message, estimated_time
@@ -253,6 +261,20 @@ def register(mcp, deps: dict):
                 "estimated_time": "20-30 segundos",
                 "info": "Usa dev_get_quotation_status(tracking_id) para consultar estado"
             }
+
+        Ejemplo con múltiples productos:
+            dev_create_quotation(
+                partner_name="ACME Corp",
+                contact_name="John Doe",
+                email="john@acme.com",
+                phone="+1234567890",
+                lead_name="Restaurant Equipment Quote",
+                products=[
+                    {"product_id": 26156, "qty": 10, "price": 9350.0},
+                    {"product_id": 26153, "qty": 20, "price": 8500.0}
+                ],
+                description="Equipment for new restaurant location"
+            )
         """
         import uuid
         import threading
@@ -275,6 +297,9 @@ def register(mcp, deps: dict):
             "product_id": product_id,
             "product_qty": product_qty,
             "product_price": product_price,
+            "products": products,
+            "description": description,
+            "x_studio_producto": x_studio_producto,
         }
 
         # Crear tarea en TaskManager
@@ -361,6 +386,20 @@ def register(mcp, deps: dict):
                 if assigned_user_id:
                     lead_values["user_id"] = assigned_user_id
 
+                # Agregar campos personalizados
+                if description:
+                    lead_values["description"] = description
+
+                # Auto-asignación de x_studio_producto (similar a core/api.py)
+                if x_studio_producto:
+                    lead_values["x_studio_producto"] = x_studio_producto
+                elif products and len(products) > 0:
+                    # Auto-asignar el primer producto del array
+                    lead_values["x_studio_producto"] = products[0].get("product_id")
+                elif product_id > 0:
+                    # Legacy: asignar desde product_id
+                    lead_values["x_studio_producto"] = product_id
+
                 lead_id = client.create("crm.lead", lead_values)
                 steps["lead"] = f"Lead creado: {lead_name} (ID: {lead_id})"
                 task.update_progress("Lead creado")
@@ -402,32 +441,62 @@ def register(mcp, deps: dict):
                 )
                 task.update_progress("Cotización creada")
 
-                # PASO 6: Agregar producto (si aplica)
-                if product_id > 0:
-                    task.update_progress("Agregando producto...")
+                # PASO 6: Agregar productos (soporta múltiples productos)
+                products_added = []
+
+                # Determinar qué productos agregar
+                products_to_add = []
+                if products and len(products) > 0:
+                    # Usar el nuevo formato de productos array
+                    for p in products:
+                        products_to_add.append(
+                            {
+                                "product_id": p.get("product_id"),
+                                "qty": p.get("qty", 1.0),
+                                "price": p.get("price", -1.0),
+                            }
+                        )
+                elif product_id > 0:
+                    # Legacy: usar product_id, product_qty, product_price
+                    products_to_add.append(
+                        {
+                            "product_id": product_id,
+                            "qty": product_qty,
+                            "price": product_price,
+                        }
+                    )
+
+                # Agregar cada producto
+                for idx, product_data in enumerate(products_to_add, 1):
+                    task.update_progress(
+                        f"Agregando producto {idx}/{len(products_to_add)}..."
+                    )
+
+                    pid = product_data["product_id"]
+                    qty = product_data["qty"]
+                    price = product_data["price"]
+
                     line_values = {
                         "order_id": sale_order_id,
-                        "product_id": product_id,
-                        "product_uom_qty": product_qty,
+                        "product_id": pid,
+                        "product_uom_qty": qty,
                     }
 
-                    if product_price > 0:
-                        line_values["price_unit"] = product_price
-                        steps["product"] = (
-                            f"Producto con precio manual: ${product_price}"
-                        )
+                    if price > 0:
+                        line_values["price_unit"] = price
+                        price_info = f"${price}"
                     else:
                         pricelist_id = 82
-                        product_data = client.read(
-                            "product.product", product_id, ["name"]
+                        product_data_read = client.read(
+                            "product.product", pid, ["name"]
                         )
-                        product_name = product_data.get("name", "Unknown")
+                        product_name = product_data_read.get("name", "Unknown")
 
                         pricelist_items = client.search_read(
                             "product.pricelist.item",
                             [
                                 ["pricelist_id", "=", pricelist_id],
-                                ["product_id", "=", product_id],
+                                ["product_id", "=", pid],
                             ],
                             ["fixed_price"],
                         )
@@ -435,22 +504,45 @@ def register(mcp, deps: dict):
                         if pricelist_items:
                             pricelist_price = pricelist_items[0].get("fixed_price", 0.0)
                             line_values["price_unit"] = pricelist_price
-                            steps["product"] = (
-                                f"Producto '{product_name}': ${pricelist_price}"
-                            )
+                            price_info = f"${pricelist_price}"
                         else:
                             product_data_full = client.read(
-                                "product.product", product_id, ["list_price"]
+                                "product.product", pid, ["list_price"]
                             )
                             auto_price = product_data_full.get("list_price", 0.0)
                             line_values["price_unit"] = auto_price
-                            steps["product"] = (
-                                f"Producto '{product_name}': ${auto_price}"
-                            )
+                            price_info = f"${auto_price}"
 
                     line_id = client.create("sale.order.line", line_values)
-                    steps["product"] += f" (línea ID: {line_id})"
-                    task.update_progress("Producto agregado")
+
+                    # Agregar a la lista de productos agregados
+                    products_added.append(
+                        {
+                            "product_id": pid,
+                            "qty": qty,
+                            "price": line_values.get("price_unit", 0.0),
+                            "line_id": line_id,
+                        }
+                    )
+
+                    if idx == 1:
+                        steps["products"] = (
+                            f"Producto 1: ID {pid} x {qty} = {price_info}"
+                        )
+                    else:
+                        steps[
+                            "products"
+                        ] += f" | Producto {idx}: ID {pid} x {qty} = {price_info}"
+
+                if products_added:
+                    task.update_progress(
+                        f"{len(products_added)} producto(s) agregado(s)"
+                    )
+
+                # Leer el lead actualizado para obtener los campos finales
+                lead_final = client.read(
+                    "crm.lead", lead_id, ["description", "x_studio_producto"]
+                )
 
                 # Resultado final
                 result = {
@@ -461,6 +553,9 @@ def register(mcp, deps: dict):
                     "opportunity_id": lead_id,
                     "sale_order_id": sale_order_id,
                     "sale_order_name": sale_order_name,
+                    "products_added": products_added,
+                    "description": lead_final.get("description"),
+                    "x_studio_producto": lead_final.get("x_studio_producto"),
                     "steps": steps,
                     "environment": "development",
                 }
@@ -551,19 +646,32 @@ def register(mcp, deps: dict):
             }
 
         response = {
-            "tracking_id": task.task_id,
-            "status": task.status,
-            "progress": task.progress,
+            "tracking_id": task.id,  # FIX: era task.task_id
+            "status": (
+                task.status.value if hasattr(task.status, "value") else str(task.status)
+            ),
             "created_at": task.created_at.isoformat(),
         }
 
-        if task.updated_at:
-            response["updated_at"] = task.updated_at.isoformat()
+        # Agregar progreso si existe
+        if task.progress:
+            response["progress"] = task.progress
 
-        if task.status == "completed" and task.result:
+        # Agregar tiempo transcurrido
+        response["elapsed_time"] = f"{task.elapsed_seconds():.2f}s"
+
+        # Agregar completed_at si terminó
+        if task.completed_at:
+            response["completed_at"] = task.completed_at.isoformat()
+
+        # Agregar resultado si completó exitosamente
+        if task.status == TaskStatus.COMPLETED and task.result:
             response["result"] = task.result
+            response["success"] = True  # Para ElevenLabs
 
-        if task.status == "failed" and task.error:
+        # Agregar error si falló
+        if task.status == TaskStatus.FAILED and task.error:
             response["error"] = task.error
+            response["success"] = False  # Para ElevenLabs
 
         return response
