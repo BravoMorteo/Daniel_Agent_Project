@@ -572,12 +572,12 @@ if __name__ == "__main__":
 
     # reparaciones()
     # field_by_id_sale_order()
-    search_partner_by_email("dev", "castillo@gmail.com")
+    search_partner_by_email("dev", "andrea@gmail.com")
     print(
         "\n*******************************menos oportunidades****************************************\n"
     )
     get_salesperson_with_least_opportunities("dev")
-    field_by_id_leads("dev", 26496)
+    field_by_id_leads("dev", 27508)
     print("\n***********************************************************************\n")
     # get_sales_team_member_ids("dev", "Ventas")
 

@@ -483,6 +483,12 @@ class HandoffRequest(BaseModel):
     additional_context: Optional[str] = Field(
         None, description="Contexto adicional de la conversación"
     )
+    lead_id: Optional[int] = Field(
+        None, description="ID del lead/oportunidad en Odoo (si existe cotización)"
+    )
+    sale_order_id: Optional[int] = Field(
+        None, description="ID de la orden de venta en Odoo (si existe cotización)"
+    )
 
     class Config:
         json_schema_extra = {
@@ -491,5 +497,6 @@ class HandoffRequest(BaseModel):
                 "reason": "Cliente desea hablar con un vendedor",
                 "conversation_id": "conv_abc123",
                 "user_name": "Juan Pérez",
+                "lead_id": 27498,
             }
         }

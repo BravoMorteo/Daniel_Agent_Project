@@ -196,6 +196,10 @@ async def elevenlabs_handoff(request: HandoffRequest):
     Cuando un cliente solicita hablar con un humano en ElevenLabs,
     este endpoint envía una notificación al vendedor por WhatsApp.
 
+    Lógica de asignación:
+    - Si hay lead_id/sale_order_id en el request: usa ese vendedor
+    - Si no: usa balanceo de carga (vendedor con menos leads)
+
     Args:
         request: Datos del handoff (teléfono, motivo, etc.)
 
@@ -208,9 +212,66 @@ async def elevenlabs_handoff(request: HandoffRequest):
             detail="WhatsApp service not configured. Check TWILIO_* environment variables.",
         )
 
+    # Importar helper y DevOdooCRMClient para la lógica de selección de vendedor
+    from core.helpers import get_user_whatsapp_number
+    from tools.crm import DevOdooCRMClient
+
+    # Determinar el vendedor a quien enviar
+    assigned_user_id = None
+    vendor_whatsapp = None
+
+    client = DevOdooCRMClient()
+
+    # Caso 1: Hay lead_id, obtener el vendedor del lead
+    if hasattr(request, "lead_id") and request.lead_id:
+        try:
+            lead = client.read("crm.lead", request.lead_id, ["user_id"])
+            if lead and lead.get("user_id"):
+                assigned_user_id = lead["user_id"][0]
+                print(
+                    f"[API Handoff] ✅ Vendedor del lead {request.lead_id}: {assigned_user_id}"
+                )
+        except Exception as e:
+            print(f"[API Handoff] ⚠️  Error obteniendo vendedor del lead: {e}")
+
+    # Caso 2: Hay sale_order_id, obtener el vendedor de la orden
+    elif hasattr(request, "sale_order_id") and request.sale_order_id:
+        try:
+            order = client.read("sale.order", request.sale_order_id, ["user_id"])
+            if order and order.get("user_id"):
+                assigned_user_id = order["user_id"][0]
+                print(
+                    f"[API Handoff] ✅ Vendedor de la orden {request.sale_order_id}: {assigned_user_id}"
+                )
+        except Exception as e:
+            print(f"[API Handoff] ⚠️  Error obteniendo vendedor de la orden: {e}")
+
+    # Caso 3: No hay lead ni orden, usar lógica de "vendedor con menos leads"
+    if not assigned_user_id:
+        print(f"[API Handoff] 🔍 Buscando vendedor con menos leads...")
+        try:
+            assigned_user_id = client.get_salesperson_with_least_opportunities()
+            if assigned_user_id:
+                print(f"[API Handoff] ✅ Vendedor con menos leads: {assigned_user_id}")
+            else:
+                print(f"[API Handoff] ⚠️  No se encontró vendedor disponible")
+        except Exception as e:
+            print(f"[API Handoff] ⚠️  Error obteniendo vendedor con menos leads: {e}")
+
+    # Obtener el número de WhatsApp del vendedor
+    if assigned_user_id:
+        vendor_whatsapp = get_user_whatsapp_number(client, assigned_user_id)
+        if not vendor_whatsapp:
+            print(
+                f"[API Handoff] ⚠️  No se pudo obtener WhatsApp del vendedor {assigned_user_id}, usando default"
+            )
+    else:
+        print(f"[API Handoff] ⚠️  No se asignó vendedor, usando número default")
+
     result = whatsapp_client.send_handoff_notification(
         user_phone=request.user_phone,
         reason=request.reason,
+        to_number=vendor_whatsapp,  # Pasar el número seleccionado
         user_name=request.user_name,
         conversation_id=request.conversation_id,
         additional_context=request.additional_context,
@@ -223,6 +284,8 @@ async def elevenlabs_handoff(request: HandoffRequest):
         "status": "ok",
         "message": "Notificación enviada al vendedor",
         "message_sid": result.get("message_sid"),
+        "assigned_user_id": assigned_user_id,
+        "selected_number": result.get("selected_number"),
     }
 
 

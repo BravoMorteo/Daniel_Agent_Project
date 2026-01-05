@@ -6,11 +6,61 @@ Funciones de utilidad compartidas para el servidor MCP-Odoo.
 
 import json
 import time
-from typing import Dict, Any, Callable, TypeVar
+from typing import Dict, Any, Callable, TypeVar, Optional
 from functools import wraps
 import xmlrpc.client
 
 T = TypeVar("T")
+
+
+def get_user_whatsapp_number(odoo_client, user_id: int) -> Optional[str]:
+    """
+    Obtiene el número de WhatsApp de un usuario.
+
+    Args:
+        odoo_client: Cliente de Odoo configurado
+        user_id: ID del usuario en res.users
+
+    Returns:
+        Número de WhatsApp en formato internacional (whatsapp:+...) o None
+    """
+    try:
+        # Leer el usuario con los campos de teléfono
+        user = odoo_client.search_read(
+            "res.users", [("id", "=", user_id)], ["mobile", "phone"], limit=1
+        )
+
+        if not user:
+            print(f"⚠️  Usuario {user_id} no encontrado")
+            return None
+
+        user_data = user[0]
+
+        # Priorizar mobile sobre phone
+        phone = user_data.get("mobile") or user_data.get("phone")
+
+        if not phone:
+            print(f"⚠️  Usuario {user_id} no tiene número de teléfono configurado")
+            return None
+
+        # Limpiar el número (quitar espacios, guiones, etc)
+        phone = (
+            phone.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+        )
+
+        # Si no empieza con +, asumir México (+52)
+        if not phone.startswith("+"):
+            phone = f"+52{phone}"
+
+        # Formato WhatsApp
+        whatsapp_number = f"whatsapp:{phone}"
+
+        print(f"✅ Número WhatsApp para usuario {user_id}: {whatsapp_number}")
+        return whatsapp_number
+
+    except Exception as e:
+        print(f"❌ Error obteniendo número de WhatsApp para usuario {user_id}: {e}")
+        return None
 
 
 def encode_content(obj: Any) -> Dict[str, Any]:
