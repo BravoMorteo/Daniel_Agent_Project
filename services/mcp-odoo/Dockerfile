@@ -17,7 +17,8 @@ RUN pip install --upgrade pip && \
                 "python-dotenv>=1.0.0" \
                 "requests>=2.32.5" \
                 "fastapi>=0.115.0" \
-                "boto3>=1.34.0"
+                "boto3>=1.34.0" \
+                "twilio>=9.0.0"
 
 # Copiar el resto del código
 COPY . /app

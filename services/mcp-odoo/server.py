@@ -22,9 +22,11 @@ from core import Config, OdooClient
 from core.api import (
     QuotationRequest,
     QuotationResponse,
+    HandoffRequest,
     task_manager,
     process_quotation_background,
 )
+from core.whatsapp import whatsapp_client
 from tools import load_all
 
 
@@ -186,6 +188,44 @@ async def get_quotation_status(tracking_id: str):
     return JSONResponse(content=task.to_dict())
 
 
+@app.post("/api/elevenlabs/handoff")
+async def elevenlabs_handoff(request: HandoffRequest):
+    """
+    Endpoint para handoff desde ElevenLabs a WhatsApp.
+
+    Cuando un cliente solicita hablar con un humano en ElevenLabs,
+    este endpoint envía una notificación al vendedor por WhatsApp.
+
+    Args:
+        request: Datos del handoff (teléfono, motivo, etc.)
+
+    Returns:
+        Status de la notificación enviada
+    """
+    if not whatsapp_client.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="WhatsApp service not configured. Check TWILIO_* environment variables.",
+        )
+
+    result = whatsapp_client.send_handoff_notification(
+        user_phone=request.user_phone,
+        reason=request.reason,
+        user_name=request.user_name,
+        conversation_id=request.conversation_id,
+        additional_context=request.additional_context,
+    )
+
+    if result["status"] == "error":
+        raise HTTPException(status_code=500, detail=result["message"])
+
+    return {
+        "status": "ok",
+        "message": "Notificación enviada al vendedor",
+        "message_sid": result.get("message_sid"),
+    }
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -203,6 +243,9 @@ if __name__ == "__main__":
     )
     print(
         f"   • Check Status:     http://{Config.HOST}:{Config.PORT}/api/quotation/status/{{id}}"
+    )
+    print(
+        f"   • WhatsApp Handoff: http://{Config.HOST}:{Config.PORT}/api/elevenlabs/handoff"
     )
     print(f"   • Health Check:     http://{Config.HOST}:{Config.PORT}/health")
     print(f"   • API Docs:         http://{Config.HOST}:{Config.PORT}/docs")

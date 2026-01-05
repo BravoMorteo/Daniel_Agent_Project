@@ -457,7 +457,39 @@ async def root():
         "endpoints": {
             "create_quotation": "/api/quotation/async",
             "check_status": "/api/quotation/status/{tracking_id}",
+            "handoff_whatsapp": "/api/elevenlabs/handoff",
             "health": "/api/health",
             "docs": "/docs",
         },
     }
+
+
+# -----------------------------
+# Modelo para Handoff WhatsApp
+# -----------------------------
+
+
+class HandoffRequest(BaseModel):
+    """Modelo para solicitud de handoff desde ElevenLabs a WhatsApp"""
+
+    user_phone: str = Field(
+        ..., description="Teléfono del usuario que solicita atención"
+    )
+    reason: str = Field("Solicita atención humana", description="Motivo del handoff")
+    conversation_id: Optional[str] = Field(
+        None, description="ID de la conversación en ElevenLabs"
+    )
+    user_name: Optional[str] = Field(None, description="Nombre del usuario")
+    additional_context: Optional[str] = Field(
+        None, description="Contexto adicional de la conversación"
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "user_phone": "+5215512345678",
+                "reason": "Cliente desea hablar con un vendedor",
+                "conversation_id": "conv_abc123",
+                "user_name": "Juan Pérez",
+            }
+        }

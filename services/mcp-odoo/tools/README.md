@@ -43,6 +43,10 @@ Tools de búsqueda genérica.
 - `search` - Busca proyectos/tareas por query
 - `fetch` - Recupera documento completo por ID
 
+### `whatsapp.py`
+Tool para notificaciones WhatsApp.
+- `whatsapp_handoff` - Envía notificación al vendedor cuando un cliente solicita atención humana
+
 ## 🔄 Sistema de Autoload
 
 ### `__init__.py`

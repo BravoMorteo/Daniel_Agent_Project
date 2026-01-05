@@ -31,6 +31,12 @@ DEV_ODOO_API_KEY=tu_api_key
 S3_LOGS_BUCKET=ilagentslogs
 AWS_REGION=us-west-2
 
+# WhatsApp / Twilio (opcional)
+TWILIO_ACCOUNT_SID=your_account_sid
+TWILIO_AUTH_TOKEN=your_auth_token
+TWILIO_WHATSAPP_FROM=whatsapp:+14155238886
+VENDEDOR_WHATSAPP=whatsapp:+5215512345678
+
 # Server
 PORT=8000
 ```
@@ -75,6 +81,7 @@ curl http://localhost:8000/api/quotation/status/quot_xxx
 ### FastAPI (Async)
 - `POST /api/quotation/async` - Crear cotización asíncrona
 - `GET /api/quotation/status/{id}` - Consultar estado
+- `POST /api/elevenlabs/handoff` - WhatsApp handoff desde ElevenLabs
 - `GET /api/health` - Health check
 - `GET /docs` - Swagger UI
 
