@@ -1,27 +1,27 @@
 """
-Cliente de WhatsApp usando Twilio para notificaciones de handoff.
+Cliente de SMS usando Twilio para notificaciones de handoff.
 """
 
 import os
-from typing import Optional
+from typing import Optional, Dict, Any
 from twilio.rest import Client
 from twilio.base.exceptions import TwilioRestException
 
 from core.logger import quotation_logger
 
 
-class WhatsAppClient:
-    """Cliente para enviar mensajes de WhatsApp vía Twilio"""
+class SMSClient:
+    """Cliente para enviar mensajes SMS vía Twilio"""
 
     def __init__(self):
         """Inicializa el cliente de Twilio con variables de entorno"""
         self.account_sid = os.getenv("TWILIO_ACCOUNT_SID")
         self.auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-        self.from_number = os.getenv("TWILIO_WHATSAPP_FROM")
-        self.default_to_number = os.getenv("VENDEDOR_WHATSAPP")  # Fallback
+        self.from_number = os.getenv("TWILIO_SMS_FROM")
+        self.default_to_number = os.getenv("VENDEDOR_SMS")  # Fallback
 
         if not all([self.account_sid, self.auth_token, self.from_number]):
-            print("⚠️  WhatsApp client not configured. Missing Twilio credentials.")
+            print("⚠️  SMS client not configured. Missing Twilio credentials.")
             self.client = None
         else:
             self.client = Client(self.account_sid, self.auth_token)
@@ -34,97 +34,98 @@ class WhatsAppClient:
         self,
         user_phone: str,
         reason: str,
-        to_number: Optional[str] = None,  # Número del vendedor a quien enviar
+        to_number: Optional[str] = None,
         user_name: Optional[str] = None,
         conversation_id: Optional[str] = None,
         additional_context: Optional[str] = None,
+        lead_data: Optional[
+            Dict[str, Any]
+        ] = None,  # Datos del lead/cotización si existe
+        assigned_user_id: Optional[int] = None,  # Para mostrar en el mensaje
     ) -> dict:
         """
-        Envía notificación de handoff al vendedor por WhatsApp
+        Envía notificación de handoff al vendedor por SMS
 
         Args:
             user_phone: Teléfono del cliente
             reason: Motivo del handoff
-            to_number: Número de WhatsApp del vendedor (opcional, usa default si no se proporciona)
+            to_number: Número SMS del vendedor (opcional, usa default si no se proporciona)
             user_name: Nombre del cliente (opcional)
             conversation_id: ID de conversación en ElevenLabs (opcional)
             additional_context: Contexto adicional (opcional)
+            lead_data: Datos del lead/cotización si ya se generó
+            assigned_user_id: ID del vendedor asignado (para mostrar en mensaje)
 
         Returns:
             dict con status y message_sid o error
         """
         if not self.is_configured():
-            print("❌ WhatsApp client not configured")
+            print("❌ SMS client not configured")
             return {
                 "status": "error",
-                "message": "WhatsApp client not configured. Check environment variables.",
+                "message": "SMS client not configured. Check environment variables.",
             }
 
-        # Usar el número proporcionado o el default
-        target_number = to_number or self.default_to_number
+        # 🧪 MODO PRUEBA: Siempre usar número de prueba
+        actual_target = "+522871322104"  # Número de prueba hardcodeado
+        selected_vendor_number = to_number or "default"
 
-        if not target_number:
-            print("❌ No target WhatsApp number provided")
-            return {
-                "status": "error",
-                "message": "No target WhatsApp number provided and no default configured.",
-            }
+        # Construir mensaje según si hay lead_data o no
+        if lead_data:
+            # Formato para cotización ya generada
+            message = f"""Nueva cotizacion
 
-        # Construir mensaje
-        message_lines = ["🔔 *Nuevo cliente solicita atención humana*", ""]
+Numero: {lead_data.get('sale_order_name', 'N/A')}
+Cliente: {user_name or 'N/A'}
+Empresa: {lead_data.get('partner_name', 'N/A')}
+Ciudad: {lead_data.get('ciudad', 'N/A')}
+Tel: {user_phone}
+Correo: {lead_data.get('email', 'N/A')}
+Productos: {lead_data.get('products', 'N/A')}
+Contexto: {additional_context or 'Cliente solicito cotizacion'}
 
-        if user_name:
-            message_lines.append(f"👤 *Cliente:* {user_name}")
-
-        message_lines.append(f"📱 *Teléfono:* {user_phone}")
-        message_lines.append(f"📝 *Motivo:* {reason}")
-
-        if conversation_id:
-            message_lines.append(f"🆔 *Conversación:* {conversation_id}")
-
-        if additional_context:
-            message_lines.append(f"\n💬 *Contexto:*\n{additional_context}")
-
-        # 🧪 MODO PRUEBA: Mostrar el número seleccionado en el mensaje
-        if to_number:
-            message_lines.append(f"\n🧪 *[PRUEBA] Vendedor seleccionado:* {to_number}")
-            message_lines.append(f"📤 *[PRUEBA] Enviando a:* {self.default_to_number}")
+[PRUEBA]
+Vendedor elegido: ID {assigned_user_id or 'N/A'}
+Numero vendedor: {selected_vendor_number}""".strip()
         else:
-            message_lines.append(
-                f"\n📤 *Enviando a número default:* {self.default_to_number}"
-            )
+            # Formato para solicitud de atención sin cotización
+            message = f"""Se solicita atencion humana
 
-        message = "\n".join(message_lines)
+Cliente: {user_name or 'N/A'}
+Tel: {user_phone}
+Contexto: {additional_context or reason}
+
+[PRUEBA]
+Vendedor elegido: ID {assigned_user_id or 'N/A'}
+Numero vendedor: {selected_vendor_number}""".strip()
 
         try:
-            # 🧪 MODO PRUEBA: Siempre enviar al número default para pruebas
-            actual_target = self.default_to_number
-
-            # Enviar mensaje
+            # Enviar SMS al número de prueba
             twilio_message = self.client.messages.create(
                 from_=self.from_number, to=actual_target, body=message
             )
 
-            print(f"✅ WhatsApp handoff notification sent. SID: {twilio_message.sid}")
-            print(f"🧪 [MODO PRUEBA] Número seleccionado: {to_number or 'default'}")
-            print(f"🧪 [MODO PRUEBA] Enviado a: {actual_target}")
+            print(f"✅ SMS handoff notification sent. SID: {twilio_message.sid}")
+            print(
+                f"🧪 [MODO PRUEBA] Vendedor seleccionado: ID {assigned_user_id}, Número: {selected_vendor_number}"
+            )
+            print(f"🧪 [MODO PRUEBA] Enviado a número de prueba: {actual_target}")
 
             return {
                 "status": "success",
                 "message_sid": twilio_message.sid,
-                "to": actual_target,  # Número real al que se envió
-                "selected_number": to_number,  # Número que fue seleccionado por lógica
+                "to": actual_target,
                 "from": self.from_number,
             }
 
         except TwilioRestException as e:
-            print(f"❌ Twilio error sending WhatsApp: {e}")
+            print(f"❌ Twilio error sending SMS: {e}")
             return {"status": "error", "message": f"Twilio error: {str(e)}"}
 
         except Exception as e:
-            print(f"❌ Unexpected error sending WhatsApp: {e}")
+            print(f"❌ Unexpected error sending SMS: {e}")
             return {"status": "error", "message": f"Unexpected error: {str(e)}"}
 
 
 # Instancia global del cliente
-whatsapp_client = WhatsAppClient()
+sms_client = SMSClient()

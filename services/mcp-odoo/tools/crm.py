@@ -6,6 +6,7 @@ DESARROLLO (Lectura y Escritura):
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel
 import os
+from datetime import datetime
 from core.tasks import TaskStatus
 
 
@@ -209,6 +210,7 @@ def register(mcp, deps: dict):
         email: str,
         phone: str,
         lead_name: str,
+        ciudad: Optional[str] = None,
         user_id: int = 0,
         product_id: int = 0,
         product_qty: float = 1.0,
@@ -242,6 +244,7 @@ def register(mcp, deps: dict):
             email: Email del contacto
             phone: Teléfono del contacto
             lead_name: Nombre del lead/oportunidad
+            ciudad: Ciudad del contacto (opcional)
             user_id: ID del vendedor (0 = asignación automática)
             product_id: ID del producto (0 = sin producto) [LEGACY - usar 'products']
             product_qty: Cantidad del producto [LEGACY - usar 'products']
@@ -348,6 +351,10 @@ def register(mcp, deps: dict):
                         "is_company": False,
                         "type": "contact",
                     }
+                    # Agregar ciudad si se proporciona
+                    if ciudad:
+                        partner_values["city"] = ciudad
+
                     partner_id = client.create("res.partner", partner_values)
                     partner_full_name = partner_name
                     steps["partner"] = (
@@ -544,7 +551,122 @@ def register(mcp, deps: dict):
                     "crm.lead", lead_id, ["description", "x_studio_producto"]
                 )
 
-                # Resultado final
+                # Enviar notificación SMS al vendedor
+                notification_data = None
+                try:
+                    from core.whatsapp import sms_client
+                    from core.helpers import get_user_whatsapp_number
+                    from datetime import datetime
+
+                    # Obtener el vendedor asignado al lead
+                    lead_with_vendor = client.read("crm.lead", lead_id, ["user_id"])
+                    vendor_id = None
+                    if lead_with_vendor and lead_with_vendor.get("user_id"):
+                        vendor_id = lead_with_vendor["user_id"][0]
+
+                    if vendor_id:
+                        # Obtener número del vendedor
+                        vendor_sms = get_user_whatsapp_number(client, vendor_id)
+                        if vendor_sms and vendor_sms.startswith("whatsapp:"):
+                            vendor_sms = vendor_sms.replace("whatsapp:", "")
+                        # Validar número (quitar si tiene X)
+                        if vendor_sms and ("X" in vendor_sms or "x" in vendor_sms):
+                            vendor_sms = None
+
+                        # Preparar datos del lead para el mensaje
+                        # Obtener nombres de productos para el mensaje
+                        product_names = []
+                        for prod in products_added:
+                            try:
+                                prod_info = client.read(
+                                    "product.product", prod["product_id"], ["name"]
+                                )
+                                if prod_info:
+                                    product_names.append(
+                                        f"{prod_info['name']} (x{prod['qty']})"
+                                    )
+                            except:
+                                product_names.append(
+                                    f"Producto ID {prod['product_id']}"
+                                )
+
+                        lead_data_for_sms = {
+                            "sale_order_name": sale_order_name,
+                            "partner_name": partner_full_name,
+                            "ciudad": (
+                                ciudad if ciudad else "N/A"
+                            ),  # Usar parámetro primero
+                            "email": email,
+                            "products": (
+                                ", ".join(product_names) if product_names else "N/A"
+                            ),
+                        }
+
+                        # Si no se proporcionó ciudad, intentar obtenerla del partner
+                        if not ciudad:
+                            try:
+                                partner_data = client.read(
+                                    "res.partner", partner_id, ["city"]
+                                )
+                                if partner_data and partner_data.get("city"):
+                                    lead_data_for_sms["ciudad"] = partner_data["city"]
+                            except Exception as e:
+                                print(f"⚠️ No se pudo obtener ciudad del partner: {e}")
+
+                        # Enviar SMS (reutilizando sms_client como lo hace message_notification)
+                        sms_result = sms_client.send_handoff_notification(
+                            user_phone=phone,
+                            reason="Nueva cotización generada",
+                            to_number=vendor_sms,
+                            user_name=contact_name,
+                            additional_context=f"Se generó la cotización {sale_order_name}",
+                            lead_data=lead_data_for_sms,
+                            assigned_user_id=vendor_id,
+                        )
+
+                        if sms_result["status"] == "success":
+                            notification_data = {
+                                "sent": True,
+                                "method": "sms",
+                                "message_sid": sms_result.get("message_sid"),
+                                "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "vendor_id": vendor_id,
+                                "vendor_number": vendor_sms or "default",
+                                "status": "success",
+                            }
+                            print(
+                                f"✅ SMS de cotización enviado. SID: {sms_result.get('message_sid')}"
+                            )
+                        else:
+                            notification_data = {
+                                "sent": False,
+                                "method": "sms",
+                                "status": "error",
+                                "error": sms_result.get("message"),
+                                "vendor_id": vendor_id,
+                            }
+                            print(
+                                f"⚠️ Error enviando SMS de cotización: {sms_result.get('message')}"
+                            )
+                    else:
+                        print("⚠️ No se pudo determinar el vendedor para enviar SMS")
+                        notification_data = {
+                            "sent": False,
+                            "method": "sms",
+                            "status": "error",
+                            "error": "No vendor assigned to lead",
+                        }
+
+                except Exception as sms_error:
+                    print(f"❌ Error al enviar SMS de cotización: {sms_error}")
+                    notification_data = {
+                        "sent": False,
+                        "method": "sms",
+                        "status": "error",
+                        "error": str(sms_error),
+                    }
+
+                # Resultado final con notificación
                 result = {
                     "partner_id": partner_id,
                     "partner_name": partner_full_name,
@@ -558,6 +680,7 @@ def register(mcp, deps: dict):
                     "x_studio_producto": lead_final.get("x_studio_producto"),
                     "steps": steps,
                     "environment": "development",
+                    "notification": notification_data,  # Agregar info de notificación
                 }
 
                 # Marcar como completado

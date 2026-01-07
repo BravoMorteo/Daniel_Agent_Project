@@ -26,7 +26,7 @@ from core.api import (
     task_manager,
     process_quotation_background,
 )
-from core.whatsapp import whatsapp_client
+from core.whatsapp import sms_client
 from tools import load_all
 
 
@@ -191,10 +191,10 @@ async def get_quotation_status(tracking_id: str):
 @app.post("/api/elevenlabs/handoff")
 async def elevenlabs_handoff(request: HandoffRequest):
     """
-    Endpoint para handoff desde ElevenLabs a WhatsApp.
+    Endpoint para handoff desde ElevenLabs a SMS.
 
     Cuando un cliente solicita hablar con un humano en ElevenLabs,
-    este endpoint envía una notificación al vendedor por WhatsApp.
+    este endpoint envía una notificación al vendedor por SMS.
 
     Lógica de asignación:
     - Si hay lead_id/sale_order_id en el request: usa ese vendedor
@@ -206,10 +206,10 @@ async def elevenlabs_handoff(request: HandoffRequest):
     Returns:
         Status de la notificación enviada
     """
-    if not whatsapp_client.is_configured():
+    if not sms_client.is_configured():
         raise HTTPException(
             status_code=503,
-            detail="WhatsApp service not configured. Check TWILIO_* environment variables.",
+            detail="SMS service not configured. Check TWILIO_* environment variables.",
         )
 
     # Importar helper y DevOdooCRMClient para la lógica de selección de vendedor
@@ -218,7 +218,7 @@ async def elevenlabs_handoff(request: HandoffRequest):
 
     # Determinar el vendedor a quien enviar
     assigned_user_id = None
-    vendor_whatsapp = None
+    vendor_sms = None
 
     client = DevOdooCRMClient()
 
@@ -258,31 +258,93 @@ async def elevenlabs_handoff(request: HandoffRequest):
         except Exception as e:
             print(f"[API Handoff] ⚠️  Error obteniendo vendedor con menos leads: {e}")
 
-    # Obtener el número de WhatsApp del vendedor
+    # Obtener el número SMS del vendedor
     if assigned_user_id:
-        vendor_whatsapp = get_user_whatsapp_number(client, assigned_user_id)
-        if not vendor_whatsapp:
+        vendor_sms = get_user_whatsapp_number(client, assigned_user_id)
+        # Limpiar prefijo whatsapp: si existe
+        if vendor_sms and vendor_sms.startswith("whatsapp:"):
+            vendor_sms = vendor_sms.replace("whatsapp:", "")
+        # Validar que el número no tenga 'X' (número oculto por privacidad en dev)
+        if vendor_sms and ("X" in vendor_sms or "x" in vendor_sms):
             print(
-                f"[API Handoff] ⚠️  No se pudo obtener WhatsApp del vendedor {assigned_user_id}, usando default"
+                f"[API Handoff] ⚠️  Número del vendedor oculto por privacidad, usando default"
+            )
+            vendor_sms = None
+        if not vendor_sms:
+            print(
+                f"[API Handoff] ⚠️  No se pudo obtener número SMS válido del vendedor {assigned_user_id}, usando default"
             )
     else:
         print(f"[API Handoff] ⚠️  No se asignó vendedor, usando número default")
 
-    result = whatsapp_client.send_handoff_notification(
+    result = sms_client.send_handoff_notification(
         user_phone=request.user_phone,
         reason=request.reason,
-        to_number=vendor_whatsapp,  # Pasar el número seleccionado
+        to_number=vendor_sms,  # Pasar el número seleccionado
         user_name=request.user_name,
         conversation_id=request.conversation_id,
         additional_context=request.additional_context,
+        assigned_user_id=assigned_user_id,  # Pasar ID del vendedor para el mensaje
     )
 
     if result["status"] == "error":
+        # Log error handoff
+        try:
+            from datetime import datetime
+            import uuid
+            from core.logger import quotation_logger
+
+            handoff_id = (
+                f"sms_{int(datetime.now().timestamp())}_{str(uuid.uuid4())[:8]}"
+            )
+            quotation_logger.log_sms_handoff(
+                handoff_id=handoff_id,
+                user_phone=request.user_phone,
+                reason=request.reason,
+                user_name=request.user_name,
+                conversation_id=request.conversation_id,
+                additional_context=request.additional_context,
+                lead_id=getattr(request, "lead_id", None),
+                sale_order_id=getattr(request, "sale_order_id", None),
+                assigned_user_id=assigned_user_id,
+                vendor_sms=vendor_sms,
+                message_sid=None,
+                status="error",
+                error=result.get("message"),
+            )
+        except Exception as log_err:
+            print(f"[API Handoff] ⚠️  Error logging failed handoff: {log_err}")
+
         raise HTTPException(status_code=500, detail=result["message"])
+
+    # Log successful handoff
+    try:
+        from datetime import datetime
+        import uuid
+        from core.logger import quotation_logger
+
+        handoff_id = f"sms_{int(datetime.now().timestamp())}_{str(uuid.uuid4())[:8]}"
+        log_path = quotation_logger.log_sms_handoff(
+            handoff_id=handoff_id,
+            user_phone=request.user_phone,
+            reason=request.reason,
+            user_name=request.user_name,
+            conversation_id=request.conversation_id,
+            additional_context=request.additional_context,
+            lead_id=getattr(request, "lead_id", None),
+            sale_order_id=getattr(request, "sale_order_id", None),
+            assigned_user_id=assigned_user_id,
+            vendor_sms=vendor_sms,
+            message_sid=result.get("message_sid"),
+            status="success",
+        )
+        print(f"[API Handoff] 📝 Handoff logged to: {log_path}")
+    except Exception as log_err:
+        print(f"[API Handoff] ⚠️  Error logging successful handoff: {log_err}")
 
     return {
         "status": "ok",
-        "message": "Notificación enviada al vendedor",
+        "message": "Notificación SMS enviada al vendedor",
         "message_sid": result.get("message_sid"),
         "assigned_user_id": assigned_user_id,
         "selected_number": result.get("selected_number"),
