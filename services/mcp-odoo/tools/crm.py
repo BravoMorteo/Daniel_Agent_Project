@@ -613,7 +613,7 @@ def register(mcp, deps: dict):
                             except Exception as e:
                                 print(f"⚠️ No se pudo obtener ciudad del partner: {e}")
 
-                        # Enviar SMS (reutilizando sms_client como lo hace message_notification)
+                        # Enviar WhatsApp (reutilizando sms_client como lo hace message_notification)
                         sms_result = sms_client.send_handoff_notification(
                             user_phone=phone,
                             reason="Nueva cotización generada",
@@ -627,7 +627,7 @@ def register(mcp, deps: dict):
                         if sms_result["status"] == "success":
                             notification_data = {
                                 "sent": True,
-                                "method": "sms",
+                                "method": "whatsapp",
                                 "message_sid": sms_result.get("message_sid"),
                                 "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                                 "vendor_id": vendor_id,
@@ -635,33 +635,35 @@ def register(mcp, deps: dict):
                                 "status": "success",
                             }
                             print(
-                                f"✅ SMS de cotización enviado. SID: {sms_result.get('message_sid')}"
+                                f"✅ WhatsApp de cotización enviado. SID: {sms_result.get('message_sid')}"
                             )
                         else:
                             notification_data = {
                                 "sent": False,
-                                "method": "sms",
+                                "method": "whatsapp",
                                 "status": "error",
                                 "error": sms_result.get("message"),
                                 "vendor_id": vendor_id,
                             }
                             print(
-                                f"⚠️ Error enviando SMS de cotización: {sms_result.get('message')}"
+                                f"⚠️ Error enviando WhatsApp de cotización: {sms_result.get('message')}"
                             )
                     else:
-                        print("⚠️ No se pudo determinar el vendedor para enviar SMS")
+                        print(
+                            "⚠️ No se pudo determinar el vendedor para enviar WhatsApp"
+                        )
                         notification_data = {
                             "sent": False,
-                            "method": "sms",
+                            "method": "whatsapp",
                             "status": "error",
                             "error": "No vendor assigned to lead",
                         }
 
                 except Exception as sms_error:
-                    print(f"❌ Error al enviar SMS de cotización: {sms_error}")
+                    print(f"❌ Error al enviar WhatsApp de cotización: {sms_error}")
                     notification_data = {
                         "sent": False,
-                        "method": "sms",
+                        "method": "whatsapp",
                         "status": "error",
                         "error": str(sms_error),
                     }

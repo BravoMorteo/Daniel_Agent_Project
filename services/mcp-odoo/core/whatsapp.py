@@ -17,11 +17,11 @@ class SMSClient:
         """Inicializa el cliente de Twilio con variables de entorno"""
         self.account_sid = os.getenv("TWILIO_ACCOUNT_SID")
         self.auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-        self.from_number = os.getenv("TWILIO_SMS_FROM")
-        self.default_to_number = os.getenv("VENDEDOR_SMS")  # Fallback
+        self.from_number = os.getenv("TWILIO_WHATSAPP_FROM")  # WhatsApp format
+        self.default_to_number = os.getenv("VENDEDOR_WHATSAPP")  # WhatsApp format
 
         if not all([self.account_sid, self.auth_token, self.from_number]):
-            print("⚠️  SMS client not configured. Missing Twilio credentials.")
+            print("⚠️  WhatsApp client not configured. Missing Twilio credentials.")
             self.client = None
         else:
             self.client = Client(self.account_sid, self.auth_token)
@@ -60,32 +60,25 @@ class SMSClient:
             dict con status y message_sid o error
         """
         if not self.is_configured():
-            print("❌ SMS client not configured")
+            print("❌ WhatsApp client not configured")
             return {
                 "status": "error",
-                "message": "SMS client not configured. Check environment variables.",
+                "message": "WhatsApp client not configured. Check environment variables.",
             }
 
-        # 🧪 MODO PRUEBA: Siempre usar número de prueba
-        actual_target = "+522871322104"  # Número de prueba hardcodeado
+        # Destino: VENDEDOR_WHATSAPP (número centralizado para recibir notificaciones)
+        actual_target = self.default_to_number
+        # El número del vendedor asignado se incluye en el cuerpo del mensaje
         selected_vendor_number = to_number or "default"
 
         # Construir mensaje según si hay lead_data o no
         if lead_data:
-            # Formato para cotización ya generada
-            message = f"""Nueva cotizacion
-
-Numero: {lead_data.get('sale_order_name', 'N/A')}
-Cliente: {user_name or 'N/A'}
-Empresa: {lead_data.get('partner_name', 'N/A')}
-Ciudad: {lead_data.get('ciudad', 'N/A')}
+            # Formato simplificado para cotización ya generada
+            message = f"""Numero: {lead_data.get('sale_order_name', 'N/A')}
 Tel: {user_phone}
-Correo: {lead_data.get('email', 'N/A')}
-Productos: {lead_data.get('products', 'N/A')}
-Contexto: {additional_context or 'Cliente solicito cotizacion'}
+Contexto: {additional_context or 'Se genero la cotizacion'}
 
 [PRUEBA]
-Vendedor elegido: ID {assigned_user_id or 'N/A'}
 Numero vendedor: {selected_vendor_number}""".strip()
         else:
             # Formato para solicitud de atención sin cotización
@@ -95,17 +88,16 @@ Cliente: {user_name or 'N/A'}
 Tel: {user_phone}
 Contexto: {additional_context or reason}
 
-[PRUEBA]
-Vendedor elegido: ID {assigned_user_id or 'N/A'}
+Vendedor asignado: ID {assigned_user_id or 'N/A'}
 Numero vendedor: {selected_vendor_number}""".strip()
 
         try:
-            # Enviar SMS al número de prueba
+            # Enviar WhatsApp message
             twilio_message = self.client.messages.create(
                 from_=self.from_number, to=actual_target, body=message
             )
 
-            print(f"✅ SMS handoff notification sent. SID: {twilio_message.sid}")
+            print(f"✅ WhatsApp handoff notification sent. SID: {twilio_message.sid}")
             print(
                 f"🧪 [MODO PRUEBA] Vendedor seleccionado: ID {assigned_user_id}, Número: {selected_vendor_number}"
             )
@@ -119,11 +111,11 @@ Numero vendedor: {selected_vendor_number}""".strip()
             }
 
         except TwilioRestException as e:
-            print(f"❌ Twilio error sending SMS: {e}")
+            print(f"❌ Twilio error sending WhatsApp: {e}")
             return {"status": "error", "message": f"Twilio error: {str(e)}"}
 
         except Exception as e:
-            print(f"❌ Unexpected error sending SMS: {e}")
+            print(f"❌ Unexpected error sending WhatsApp: {e}")
             return {"status": "error", "message": f"Unexpected error: {str(e)}"}
 
 
