@@ -8,6 +8,121 @@ from pydantic import BaseModel
 import os
 from datetime import datetime
 from core.tasks import TaskStatus
+import unicodedata
+import re
+
+
+def normalize_email(email: str) -> str:
+    """
+    Normaliza y limpia un email eliminando acentos, espacios y caracteres inválidos.
+    Corrige automáticamente errores comunes.
+
+    Args:
+        email: Email a normalizar
+
+    Returns:
+        Email normalizado y corregido en minúsculas sin acentos
+
+    Raises:
+        ValueError: Si el email no tiene el formato mínimo requerido (usuario@dominio)
+
+    Example:
+        normalize_email("López@Gmail.com") -> "lopez@gmail.com"
+        normalize_email("aguilar@gmail.com7") -> "aguilar@gmail.com"
+        normalize_email("test@test.co1m") -> "test@test.com"
+    """
+    # Guardar original para logs
+    original = email
+
+    # Eliminar espacios al inicio y final
+    email = email.strip()
+
+    # Convertir a minúsculas
+    email = email.lower()
+
+    # Eliminar acentos y diacríticos
+    email = unicodedata.normalize("NFKD", email)
+    email = email.encode("ASCII", "ignore").decode("ASCII")
+
+    # Eliminar espacios internos que puedan quedar
+    email = email.replace(" ", "")
+    email = email.replace(",", "")
+
+    # Intentos de corrección y normalización en cadena
+    # 1) Si hay múltiples @, conservar el primero y concatenar el resto
+    if email.count("@") > 1:
+        parts = email.split("@")
+        user = parts[0]
+        domain = "".join(parts[1:])
+        email = f"{user}@{domain}"
+
+    # 2) Si no hay @, intentar inferirlo reemplazando el primer punto por @ (heurística)
+    if email.count("@") == 0:
+        if "." in email:
+            idx = email.find(".")
+            user = email[:idx]
+            domain = email[idx + 1 :]
+            email = f"{user}@{domain}"
+        else:
+            # No se puede inferir, fallback al email genérico
+            fallback = "emailinvalido@corporativosade.com.mx"
+            print(f"⚠️ Email inválido '{original}' -> usando fallback '{fallback}'")
+            return fallback
+
+    # A partir de aquí deberíamos tener 1 @
+    if email.count("@") != 1:
+        fallback = "emailinvalido@corporativosade.com.mx"
+        print(f"⚠️ Email inválido '{original}' -> usando fallback '{fallback}'")
+        return fallback
+
+    user, domain = email.split("@", 1)
+
+    # Usuario no puede estar vacío
+    if not user:
+        fallback = "emailinvalido@corporativosade.com.mx"
+        print(
+            f"⚠️ Email inválido '{original}' (usuario vacío) -> usando fallback '{fallback}'"
+        )
+        return fallback
+
+    # CORRECCIÓN AUTOMÁTICA: Eliminar números al final de la extensión
+    domain = re.sub(r"(\.[a-zA-Z]+)\d+$", r"\1", domain)
+
+    # CORRECCIÓN AUTOMÁTICA: Arreglar números mezclados en la extensión
+    domain = re.sub(r"\.([a-zA-Z]+)\d+([a-zA-Z]+)$", r".\1\2", domain)
+
+    # Si el dominio no tiene punto, intentar añadir .com
+    if "." not in domain:
+        domain_candidate = domain + ".com"
+        email_candidate = f"{user}@{domain_candidate}"
+        email_pattern = r"^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+        if re.match(email_pattern, email_candidate):
+            domain = domain_candidate
+        else:
+            fallback = "emailinvalido@corporativosade.com.mx"
+            print(
+                f"⚠️ Email '{original}' no pudo ser corregido -> usando fallback '{fallback}'"
+            )
+            return fallback
+
+    # Reconstruir email limpio
+    email_clean = f"{user}@{domain}"
+
+    # Validación final del formato
+    email_pattern = r"^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+
+    if not re.match(email_pattern, email_clean):
+        fallback = "emailinvalido@corporativosade.com.mx"
+        print(
+            f"⚠️ Email '{original}' inválido después de limpieza -> usando fallback '{fallback}'"
+        )
+        return fallback
+
+    # Log si se hizo corrección
+    if original != email_clean:
+        print(f"📧 Email corregido: '{original}' -> '{email_clean}'")
+
+    return email_clean
 
 
 class QuotationResult(BaseModel):
@@ -296,6 +411,7 @@ def register(mcp, deps: dict):
             "email": email,
             "phone": phone,
             "lead_name": lead_name,
+            "ciudad": ciudad,
             "user_id": user_id,
             "product_id": product_id,
             "product_qty": product_qty,
@@ -325,11 +441,48 @@ def register(mcp, deps: dict):
                 task.update_progress("Iniciando cliente Odoo...")
 
                 client = get_dev_client()
+
+                # Verificar conexión de Odoo con retry mejorado
+                max_retries = 4
+                retry_delays = [3, 5, 10]  # Delays progresivos en segundos
+
+                for attempt in range(max_retries):
+                    try:
+                        # Test de conexión simple
+                        client.search_read("res.partner", [], ["id"], limit=1)
+                        if attempt > 0:
+                            print(f"✅ Conexión Odoo exitosa en intento {attempt + 1}")
+                        break
+                    except Exception as conn_error:
+                        error_type = type(conn_error).__name__
+                        if attempt < max_retries - 1:
+                            delay = (
+                                retry_delays[attempt]
+                                if attempt < len(retry_delays)
+                                else 10
+                            )
+                            print(
+                                f"⚠️ Intento {attempt + 1}/{max_retries} falló ({error_type}), esperando {delay}s..."
+                            )
+                            import time
+
+                            time.sleep(delay)
+                        else:
+                            raise Exception(
+                                f"Odoo connection failed after {max_retries} attempts: {str(conn_error)[:200]}"
+                            )
+
                 steps = {}
 
                 # PASO 1: Verificar/Crear Partner
                 task.update_progress("Verificando partner...")
-                email_normalizado = email.strip().lower()
+
+                # Validar y normalizar email
+                try:
+                    email_normalizado = normalize_email(email)
+                except ValueError as email_error:
+                    raise Exception(f"Email inválido: {str(email_error)}")
+
                 existing_partners = client.search_read(
                     "res.partner",
                     [("email", "=", email_normalizado)],
@@ -698,7 +851,31 @@ def register(mcp, deps: dict):
 
             except Exception as e:
                 # Marcar como fallido
+                import traceback
+
                 error_msg = str(e)
+
+                # Capturar más contexto del error
+                error_details = {
+                    "error_type": type(e).__name__,
+                    "error_message": error_msg[:500],  # Limitar tamaño
+                    "traceback": traceback.format_exc()[:1000],  # Limitar traceback
+                }
+
+                # Log más detallado
+                print(f"❌ Error en cotización {tracking_id}:")
+                print(f"   Tipo: {error_details['error_type']}")
+                print(f"   Mensaje: {error_details['error_message']}")
+
+                # Si es error HTML de Odoo
+                if error_msg.startswith("<!doctype html") or error_msg.startswith(
+                    "<!DOCTYPE"
+                ):
+                    error_msg = "Odoo server error (502/HTML response). Server may be down or overloaded."
+                    print(
+                        f"   ⚠️ Odoo devolvió HTML en lugar de XML-RPC - servidor caído o error 502"
+                    )
+
                 task.fail(error_msg)
 
                 # Log de error
@@ -708,6 +885,47 @@ def register(mcp, deps: dict):
                     status="failed",
                     error=error_msg,
                 )
+
+                # 🚨 ENVIAR NOTIFICACIÓN DE ERROR AL VENDEDOR
+                try:
+                    from core.whatsapp import sms_client
+
+                    # Construir contexto del error para el mensaje
+                    error_context = f"""❌ ERROR EN COTIZACIÓN
+
+Tracking ID: {tracking_id}
+Error: {error_details['error_type']}
+Mensaje: {error_details['error_message'][:200]}
+
+📋 Datos de entrada:
+Partner: {params.get('partner_name', 'N/A')}
+Email: {params.get('email', 'N/A')}
+Tel: {params.get('phone', 'N/A')}
+Producto ID: {params.get('product_id', 'N/A')}
+Ciudad: {params.get('ciudad', 'N/A')}"""
+
+                    # Enviar notificación al vendedor
+                    notification_result = sms_client.send_handoff_notification(
+                        user_phone=params.get("phone", "N/A"),
+                        reason="Error en cotización",
+                        user_name=params.get("partner_name", "N/A"),
+                        additional_context=error_context,
+                        assigned_user_id=0,
+                    )
+
+                    if notification_result.get("status") == "success":
+                        print(
+                            f"📱 Notificación de error enviada. SID: {notification_result.get('message_sid')}"
+                        )
+                    else:
+                        print(
+                            f"⚠️ No se pudo enviar notificación de error: {notification_result.get('message')}"
+                        )
+
+                except Exception as notification_error:
+                    print(
+                        f"⚠️ Error al enviar notificación de fallo: {notification_error}"
+                    )
 
         # Lanzar thread
         thread = threading.Thread(target=execute_quotation_background, daemon=True)
