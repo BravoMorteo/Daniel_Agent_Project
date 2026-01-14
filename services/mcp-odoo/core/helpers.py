@@ -36,8 +36,8 @@ def get_user_whatsapp_number(odoo_client, user_id: int) -> Optional[str]:
 
         user_data = user[0]
 
-        # Priorizar mobile sobre phone
-        phone = user_data.get("mobile") or user_data.get("phone")
+        # Priorizar phone sobre mobile
+        phone = user_data.get("phone") or user_data.get("mobile")
 
         if not phone:
             print(f"⚠️  Usuario {user_id} no tiene número de teléfono configurado")

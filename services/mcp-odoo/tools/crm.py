@@ -904,13 +904,14 @@ Tel: {params.get('phone', 'N/A')}
 Producto ID: {params.get('product_id', 'N/A')}
 Ciudad: {params.get('ciudad', 'N/A')}"""
 
-                    # Enviar notificación al vendedor
+                    # Enviar notificación al vendedor (con flag de error)
                     notification_result = sms_client.send_handoff_notification(
                         user_phone=params.get("phone", "N/A"),
                         reason="Error en cotización",
                         user_name=params.get("partner_name", "N/A"),
                         additional_context=error_context,
                         assigned_user_id=0,
+                        is_error_notification=True,  # NUEVO: flag para usar número fijo y validar ENABLE_ERROR_NOTIFICATIONS
                     )
 
                     if notification_result.get("status") == "success":
