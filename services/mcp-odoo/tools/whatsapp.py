@@ -32,6 +32,9 @@ def register(mcp, deps: dict):
     cuando un cliente solicita atención humana.
     """
 
+    # Cliente de PRODUCCIÓN (solo lectura - desde deps)
+    prod_client = deps["odoo"]
+
     # Cliente de DESARROLLO - lazy loading
     dev_client = None
 
@@ -43,6 +46,19 @@ def register(mcp, deps: dict):
 
             dev_client = DevOdooCRMClient()
         return dev_client
+
+    def get_odoo_client():
+        """Retorna el cliente de Odoo según el ambiente configurado."""
+        import os
+
+        environment = os.getenv("ODOO_ENVIRONMENT", "dev").lower()
+        print(f"[MCP Tool] 🌍 Ambiente detectado: {environment}")
+        if environment == "prod":
+            print(f"[MCP Tool] 📊 Usando cliente de PRODUCCIÓN")
+            return prod_client
+        else:
+            print(f"[MCP Tool] 🔧 Usando cliente de DESARROLLO")
+            return get_dev_client()
 
     @mcp.tool(
         name="message_notification",
@@ -95,7 +111,7 @@ def register(mcp, deps: dict):
         assigned_user_id = None
         vendor_sms = None
 
-        client = get_dev_client()
+        client = get_odoo_client()  # Usa el cliente según ODOO_ENVIRONMENT
 
         # Caso 1: Hay lead_id, obtener el vendedor del lead
         if lead_id:
@@ -153,7 +169,8 @@ def register(mcp, deps: dict):
             except Exception as e:
                 print(f"[MCP Tool] ❌ Error en lógica de balanceo: {e}")
 
-        # Obtener el número SMS del vendedor (reutilizamos la función pero para SMS)
+        # Obtener el número SMS del vendedor
+        vendor_sms = None
         if assigned_user_id:
             vendor_sms = get_user_whatsapp_number(client, assigned_user_id)
             # Limpiar prefijo whatsapp: si existe
@@ -161,16 +178,14 @@ def register(mcp, deps: dict):
                 vendor_sms = vendor_sms.replace("whatsapp:", "")
             # Validar que el número no tenga 'X' (número oculto por privacidad en dev)
             if vendor_sms and ("X" in vendor_sms or "x" in vendor_sms):
-                print(
-                    f"[MCP Tool] ⚠️  Número del vendedor oculto por privacidad, usando default"
-                )
+                print(f"[MCP Tool] ⚠️  Número del vendedor oculto por privacidad")
                 vendor_sms = None
-            if not vendor_sms:
-                print(
-                    f"[MCP Tool] ⚠️  No se pudo obtener número SMS válido del vendedor {assigned_user_id}, usando default"
-                )
-        else:
-            print(f"[MCP Tool] ⚠️  No se asignó vendedor, usando número default")
+
+        # Si no se pudo obtener número del vendedor, es un error
+        if not vendor_sms:
+            error_msg = f"No se pudo obtener número válido del vendedor (ID: {assigned_user_id})"
+            print(f"[MCP Tool] ❌ {error_msg}")
+            raise ValueError(error_msg)
 
         # Si hay lead_id, intentar obtener datos de la cotización para el mensaje
         lead_data = None

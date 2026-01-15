@@ -302,8 +302,8 @@ def register(mcp, deps: dict):
     DESARROLLO (Lectura y Escritura):
     - dev_create_quotation: Flujo completo para crear cotización desde lead
     """
-    # Cliente de PRODUCCIÓN (solo lectura)
-    odoo = deps["odoo"]
+    # Cliente de PRODUCCIÓN (desde deps)
+    prod_client = deps["odoo"]
 
     # Cliente de DESARROLLO - lazy loading
     dev_client = None
@@ -314,6 +314,19 @@ def register(mcp, deps: dict):
         if dev_client is None:
             dev_client = DevOdooCRMClient()
         return dev_client
+
+    def get_odoo_client():
+        """Retorna el cliente de Odoo según el ambiente configurado."""
+        import os
+
+        environment = os.getenv("ODOO_ENVIRONMENT", "dev").lower()
+        print(f"[CRM Tool] 🌍 Ambiente detectado: {environment}")
+        if environment == "prod":
+            print(f"[CRM Tool] 📊 Usando cliente de PRODUCCIÓN")
+            return prod_client
+        else:
+            print(f"[CRM Tool] 🔧 Usando cliente de DESARROLLO")
+            return get_dev_client()
 
     @mcp.tool(
         name="dev_create_quotation",
@@ -440,7 +453,7 @@ def register(mcp, deps: dict):
                 task.start()
                 task.update_progress("Iniciando cliente Odoo...")
 
-                client = get_dev_client()
+                client = get_odoo_client()  # Usa el cliente según ODOO_ENVIRONMENT
 
                 # Verificar conexión de Odoo con retry mejorado
                 max_retries = 4
