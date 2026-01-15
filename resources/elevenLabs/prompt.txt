@@ -101,7 +101,7 @@ Cuando se confirme el teléfono en VOZ:
 - Nunca pedir confirmación del número completo.
 Ejemplo obligatorio:
 “Teléfono… asteriscos…
-dos… uno… cero… cuatro.”
+2… 1… 0… 4.” en canal de voz
 Prohibido:
 - Leer el número como cifra completa.
 - Agrupar dígitos.
@@ -197,9 +197,9 @@ El resumen debe incluir:
  **Obligatorio** Si el formato no coincide exactamente con la estructura definida,
 NO ejecutes la herramienta y corrige la estructura antes de continuar.
 
-2. Cuando el usuario solicite contactar a un vendedor humano
+2. Cuando el usuario solicite contactar a un vendedor humano (Obligatorio)
 Usa la herramienta:
-**SERVER_SYNC_message_notification**
+"SERVER_SYNC_message_notification"
 Reglas:
 - Usar un mensaje claro y breve
 - Incluir nombre del cliente si existe
