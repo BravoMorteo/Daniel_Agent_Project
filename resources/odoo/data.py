@@ -576,7 +576,7 @@ if __name__ == "__main__":
     print(
         "\n*******************************menos oportunidades****************************************\n"
     )
-    get_salesperson_with_least_opportunities("dev")
+    get_salesperson_with_least_opportunities("prod")
     field_by_id_leads("dev", 27508)
     print("\n***********************************************************************\n")
     # get_sales_team_member_ids("dev", "Ventas")
