@@ -1,13 +1,49 @@
 #!/usr/bin/env python3
 """
+═══════════════════════════════════════════════════════════════════════
 SERVIDOR MCP-ODOO HÍBRIDO
-==========================
-Servidor híbrido: MCP Protocol + FastAPI REST
+═══════════════════════════════════════════════════════════════════════
 
-Endpoints:
-- /mcp       → MCP Protocol (SSE automático en /mcp/sse)
-- /api/*     → REST API (ElevenLabs, webhooks)
-- /health    → Health check
+DESCRIPCIÓN:
+    Servidor híbrido que combina dos protocolos en un solo proceso:
+    - Model Context Protocol (MCP): Para que LLMs como Claude puedan
+      usar herramientas de Odoo
+    - FastAPI REST: Para endpoints HTTP tradicionales (webhooks, APIs)
+
+ARQUITECTURA:
+    ┌─────────────────────────────────────────────────────┐
+    │           FastAPI App (Puerto 8000)                 │
+    ├─────────────────────────────────────────────────────┤
+    │  /mcp/*      → MCP Protocol (SSE en /mcp/sse)      │
+    │  /api/*      → REST API Endpoints                   │
+    │  /health     → Health check                         │
+    │  /docs       → Swagger UI automático                │
+    └─────────────────────────────────────────────────────┘
+
+ENDPOINTS PRINCIPALES:
+    - /mcp/sse      → Stream SSE para Model Context Protocol
+    - /api/quotation/async → Crear cotización asíncrona
+    - /api/quotation/status/{id} → Consultar estado de cotización
+    - /api/elevenlabs/handoff → Notificar handoff a vendedor
+
+HERRAMIENTAS MCP DISPONIBLES:
+    Las herramientas se cargan dinámicamente desde /tools:
+    - CRM: create/read leads, opportunities
+    - Sales: create/read/update sale orders
+    - Projects: list/search projects
+    - Tasks: list/search tasks
+    - Users: list/search users
+    - Search: búsqueda general en Odoo
+    - WhatsApp: notificaciones de handoff
+
+USO:
+    python server.py
+    # Servidor en http://localhost:8000
+    # Docs en http://localhost:8000/docs
+
+AUTOR: BravoMorteo
+FECHA: Enero 2026
+═══════════════════════════════════════════════════════════════════════
 """
 
 import uvicorn
@@ -30,31 +66,53 @@ from core.whatsapp import sms_client
 from tools import load_all
 
 
-# -----------------------------
-# Inicialización MCP
-# -----------------------------
+# ═══════════════════════════════════════════════════════════════════════
+# INICIALIZACIÓN MCP
+# ═══════════════════════════════════════════════════════════════════════
+# El servidor MCP permite que LLMs (como Claude) usen herramientas de Odoo
+# Las herramientas se registran una sola vez al inicio
+
 mcp = FastMCP(Config.MCP_NAME)
-deps: Dict[str, Any] = {}
-_tools_loaded = False
+deps: Dict[str, Any] = {}  # Dependencias compartidas (OdooClient, etc.)
+_tools_loaded = False  # Flag para cargar tools solo una vez
 
 
 def init_tools_once() -> None:
-    """Carga cliente Odoo y registra tools modulares una sola vez"""
+    """
+    Inicializa el cliente Odoo y carga todas las herramientas MCP.
+
+    Este método se ejecuta UNA SOLA VEZ al inicio del servidor.
+
+    Proceso:
+        1. Valida las variables de entorno requeridas
+        2. Crea el cliente de Odoo (OdooClient)
+        3. Carga dinámicamente todas las herramientas desde /tools
+        4. Registra las herramientas en el servidor MCP
+
+    Las herramientas disponibles incluyen:
+        - crm.py: Gestión de leads y oportunidades
+        - sales.py: Gestión de órdenes de venta
+        - projects.py: Búsqueda de proyectos
+        - tasks.py: Búsqueda de tareas
+        - users.py: Búsqueda de usuarios
+        - search.py: Búsqueda general
+        - whatsapp.py: Notificaciones
+    """
     global _tools_loaded
 
     if _tools_loaded:
         return
 
-    # Validar configuración
+    # Validar configuración requerida
     missing = Config.validate()
     if missing:
         print(f"[WARN] Missing environment variables: {', '.join(missing)}")
         print("[INFO] Server will start but Odoo operations will fail.")
 
-    # Inicializar cliente Odoo
+    # Inicializar cliente Odoo (conexión XML-RPC)
     deps["odoo"] = OdooClient()
 
-    # Cargar todos los tools
+    # Cargar todas las herramientas desde el directorio /tools
     print("[INFO] Loading tools from tools/ directory...")
     load_all(mcp, deps)
 
@@ -62,25 +120,38 @@ def init_tools_once() -> None:
     print("[INFO] MCP tools registered successfully.")
 
 
-# -----------------------------
-# ASGI Wrapper para arreglar Host header
-# -----------------------------
+# ═══════════════════════════════════════════════════════════════════════
+# ASGI WRAPPER PARA COMPATIBILIDAD CON PROXIES
+# ═══════════════════════════════════════════════════════════════════════
+# FastMCP valida el header "Host" contra una lista de hosts permitidos.
+# Este wrapper permite conexiones desde cualquier dominio (ngrok, AWS, etc.)
+# reescribiendo el Host header internamente a localhost.
+
 _mcp_app_internal = mcp.sse_app()
 
 
 async def mcp_app_wrapper(scope, receive, send):
     """
-    Wrapper ASGI que permite cualquier host y delega al MCP app real.
-    Necesario para compatibilidad con App Runner, ngrok y otros proxies.
+    Wrapper ASGI que permite conexiones desde cualquier host.
 
-    FastMCP valida el Host header contra una lista de hosts permitidos.
-    Este wrapper siempre usa 'localhost:8000' internamente para FastMCP,
-    permitiendo conexiones desde cualquier dominio externo.
+    PROBLEMA:
+        FastMCP solo acepta conexiones desde hosts específicos.
+        Esto falla cuando usas proxies como ngrok, App Runner, etc.
 
-    También intercepta las respuestas para corregir headers de Location
-    en redirects que puedan contener localhost.
+    SOLUCIÓN:
+        Intercepta el header "Host" y lo reescribe a "localhost:8000"
+        internamente para FastMCP, mientras mantiene el host original
+        para respuestas.
+
+    También corrige los headers de "Location" en redirects HTTP para
+    que apunten al dominio real en lugar de localhost.
+
+    Args:
+        scope: Información de la conexión ASGI
+        receive: Canal para recibir mensajes
+        send: Canal para enviar respuestas
     """
-    # Guardar el host original
+    # Guardar el host original del request
     original_host = None
     original_scheme = scope.get("scheme", "http")
 
@@ -105,8 +176,9 @@ async def mcp_app_wrapper(scope, receive, send):
 
         scope["headers"] = new_headers
 
-    # Wrapper para send que intercepta respuestas
+    # Wrapper para send() que intercepta respuestas
     async def send_wrapper(message):
+        """Corrige headers de Location en redirects"""
         if message["type"] == "http.response.start" and original_host:
             # Modificar el header Location en redirects
             headers = list(message.get("headers", []))
@@ -128,36 +200,51 @@ async def mcp_app_wrapper(scope, receive, send):
 
         await send(message)
 
+    # Delegar al servidor MCP real
     await _mcp_app_internal(scope, receive, send_wrapper)
 
 
-# -----------------------------
-# FastAPI App
-# -----------------------------
+# ═══════════════════════════════════════════════════════════════════════
+# FASTAPI APP (REST API)
+# ═══════════════════════════════════════════════════════════════════════
+# Esta es la aplicación principal que expone tanto MCP como REST endpoints
+
 app = FastAPI(
     title="MCP-Odoo Hybrid Server",
-    description="MCP Protocol + REST API",
+    description="Model Context Protocol + REST API para Odoo ERP",
     version="2.0.0",
 )
 
-# Inicializar tools al inicio
+# Inicializar herramientas MCP al inicio
 init_tools_once()
 
-# Montar MCP usando el wrapper ASGI
-# Esto automáticamente expone:
-#   /mcp/sse → SSE stream
-#   /mcp/messages → JSON-RPC endpoint
+# Montar el servidor MCP en /mcp
+# Esto expone automáticamente:
+#   /mcp/sse → Stream SSE para el protocolo MCP
+#   /mcp/messages → Endpoint JSON-RPC
 app.mount("/mcp", mcp_app_wrapper)
 
 
-# -----------------------------
-# REST API Endpoints
-# -----------------------------
+# ═══════════════════════════════════════════════════════════════════════
+# REST API ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════
+# Endpoints HTTP tradicionales para integraciones externas
 
 
 @app.get("/health")
 async def health_check():
-    """Health check para App Runner / Docker"""
+    """
+    Health check para monitoreo y balanceadores de carga.
+
+    Returns:
+        dict: Estado del servidor
+            - ok (bool): Siempre True si el servidor responde
+            - mcp_loaded (bool): Si las herramientas MCP están cargadas
+
+    Ejemplo:
+        GET /health
+        → {"ok": true, "mcp_loaded": true}
+    """
     return {"ok": True, "mcp_loaded": _tools_loaded}
 
 
@@ -165,9 +252,72 @@ async def health_check():
 async def create_quotation_async(
     request: QuotationRequest, background_tasks: BackgroundTasks
 ):
-    """Crear cotización asíncrona"""
+    """
+    Crea una cotización completa de forma ASÍNCRONA.
+
+    FLUJO:
+        1. Valida los datos del request
+        2. Genera un tracking_id único
+        3. Crea una tarea en TaskManager (estado: queued)
+        4. Programa procesamiento en background
+        5. Retorna tracking_id inmediatamente
+
+    El procesamiento en background:
+        - Crea/busca el cliente (partner)
+        - Crea el lead
+        - Crea la oportunidad
+        - Crea la orden de venta
+        - Agrega las líneas de productos
+        - Registra todo en logs (local + S3)
+
+    Args:
+        request (QuotationRequest): Datos de la cotización
+            - partner_name: Nombre del cliente
+            - contact_name: Nombre del contacto
+            - email: Email del contacto
+            - phone: Teléfono del contacto
+            - lead_name: Nombre del lead/oportunidad
+            - product_id: ID del producto en Odoo (opcional)
+            - products: Lista de productos (alternativa)
+            - product_qty: Cantidad (default: 1)
+            - product_price: Precio (default: -1 = precio de Odoo)
+        background_tasks: Gestor de tareas asíncronas de FastAPI
+
+    Returns:
+        QuotationResponse: Información del tracking
+            - tracking_id: ID para consultar el estado
+            - status: "queued" (en cola)
+            - message: Mensaje informativo
+            - estimated_time: Tiempo estimado de procesamiento
+            - status_url: URL para consultar el estado
+
+    Ejemplo:
+        POST /api/quotation/async
+        {
+            "partner_name": "Acme Corp",
+            "contact_name": "John Doe",
+            "email": "john@acme.com",
+            "phone": "+1234567890",
+            "lead_name": "Cotización Robot PUDU",
+            "product_id": 12345,
+            "product_qty": 2
+        }
+
+        → {
+            "tracking_id": "quot_abc123def456",
+            "status": "queued",
+            "message": "Cotización en proceso...",
+            "estimated_time": "20-30 segundos",
+            "status_url": "/api/quotation/status/quot_abc123def456"
+        }
+    """
+    # Generar tracking ID único
     task_id = f"quot_{uuid.uuid4().hex[:12]}"
+
+    # Crear tarea en TaskManager
     task = task_manager.create_task(task_id, request.dict())
+
+    # Programar procesamiento en background
     background_tasks.add_task(process_quotation_background, task_id, request.dict())
 
     return QuotationResponse(
@@ -181,7 +331,49 @@ async def create_quotation_async(
 
 @app.get("/api/quotation/status/{tracking_id}")
 async def get_quotation_status(tracking_id: str):
-    """Consultar estado de cotización"""
+    """
+    Consulta el estado de una cotización asíncrona.
+
+    Estados posibles:
+        - queued: En cola, esperando procesamiento
+        - processing: En proceso
+        - completed: Completada exitosamente
+        - failed: Falló con error
+
+    Args:
+        tracking_id (str): El tracking_id devuelto por /api/quotation/async
+
+    Returns:
+        dict: Estado completo de la tarea
+            - tracking_id: ID de la tarea
+            - status: Estado actual
+            - input: Datos del request original
+            - output: Resultado (si completó)
+            - error: Mensaje de error (si falló)
+            - created_at: Timestamp de creación
+            - updated_at: Timestamp de última actualización
+
+    Raises:
+        HTTPException 404: Si el tracking_id no existe
+
+    Ejemplo:
+        GET /api/quotation/status/quot_abc123def456
+
+        → {
+            "tracking_id": "quot_abc123def456",
+            "status": "completed",
+            "input": {...},
+            "output": {
+                "partner_id": 12345,
+                "lead_id": 67890,
+                "sale_order_id": 11111,
+                "sale_order_name": "S12345"
+            },
+            "error": null,
+            "created_at": "2026-01-30T10:00:00",
+            "updated_at": "2026-01-30T10:00:25"
+        }
+    """
     task = task_manager.get_task(tracking_id)
     if not task:
         raise HTTPException(status_code=404, detail="Tracking ID no encontrado")
@@ -191,38 +383,83 @@ async def get_quotation_status(tracking_id: str):
 @app.post("/api/elevenlabs/handoff")
 async def elevenlabs_handoff(request: HandoffRequest):
     """
-    Endpoint para handoff desde ElevenLabs a SMS.
+    Endpoint para handoff: transferir cliente a un vendedor humano.
 
-    Cuando un cliente solicita hablar con un humano en ElevenLabs,
-    este endpoint envía una notificación al vendedor por SMS.
+    CASOS DE USO:
+        - Cliente solicita hablar con un humano en ElevenLabs
+        - Sistema necesita escalar a atención personalizada
+        - Cliente tiene dudas que requieren vendedor experto
 
-    Lógica de asignación:
-    - Si hay lead_id/sale_order_id en el request: usa ese vendedor
-    - Si no: usa balanceo de carga (vendedor con menos leads)
+    LÓGICA DE ASIGNACIÓN DE VENDEDOR:
+        1. Si hay lead_id: usa el vendedor asignado al lead
+        2. Si hay sale_order_id: usa el vendedor de la orden
+        3. Si no hay ninguno: asigna al vendedor con menos leads (balanceo)
+
+    PROCESO:
+        1. Valida que el servicio de SMS esté configurado
+        2. Determina el vendedor usando la lógica anterior
+        3. Obtiene el número de WhatsApp del vendedor desde Odoo
+        4. Envía notificación SMS/WhatsApp con datos del cliente
+        5. Registra el handoff en logs (local + S3)
 
     Args:
-        request: Datos del handoff (teléfono, motivo, etc.)
+        request (HandoffRequest): Datos del handoff
+            - user_phone (str): Teléfono del cliente
+            - reason (str): Motivo del handoff
+            - user_name (str, opcional): Nombre del cliente
+            - conversation_id (str, opcional): ID de conversación ElevenLabs
+            - lead_id (int, opcional): ID del lead en Odoo
+            - sale_order_id (int, opcional): ID de la orden de venta
+            - additional_context (str, opcional): Contexto adicional
 
     Returns:
-        Status de la notificación enviada
+        dict: Resultado del handoff
+            - status: "ok" si se envió correctamente
+            - message: Mensaje de confirmación
+            - message_sid: ID del mensaje de Twilio
+            - assigned_user_id: ID del vendedor asignado
+            - selected_number: Número al que se envió el SMS
+
+    Raises:
+        HTTPException 503: Si el servicio de SMS no está configurado
+        HTTPException 500: Si falla el envío del mensaje
+
+    Ejemplo:
+        POST /api/elevenlabs/handoff
+        {
+            "user_phone": "+5215512345678",
+            "reason": "Cliente solicita información personalizada",
+            "user_name": "Juan Pérez",
+            "conversation_id": "conv_abc123",
+            "additional_context": "Preguntó por robots para restaurante"
+        }
+
+        → {
+            "status": "ok",
+            "message": "Notificación SMS enviada al vendedor",
+            "message_sid": "SM1234567890",
+            "assigned_user_id": 42,
+            "selected_number": "+5215587654321"
+        }
     """
+    # Validar que el servicio de SMS esté configurado
     if not sms_client.is_configured():
         raise HTTPException(
             status_code=503,
             detail="SMS service not configured. Check TWILIO_* environment variables.",
         )
 
-    # Importar helper y DevOdooCRMClient para la lógica de selección de vendedor
+    # Importar dependencias necesarias
     from core.helpers import get_user_whatsapp_number
     from tools.crm import DevOdooCRMClient
 
-    # Determinar el vendedor a quien enviar
+    # Variables para el vendedor asignado
     assigned_user_id = None
     vendor_sms = None
 
     client = DevOdooCRMClient()
 
-    # Caso 1: Hay lead_id, obtener el vendedor del lead
+    # CASO 1: Hay lead_id, obtener el vendedor del lead
     if hasattr(request, "lead_id") and request.lead_id:
         try:
             lead = client.read("crm.lead", request.lead_id, ["user_id"])
@@ -234,7 +471,7 @@ async def elevenlabs_handoff(request: HandoffRequest):
         except Exception as e:
             print(f"[API Handoff] ⚠️  Error obteniendo vendedor del lead: {e}")
 
-    # Caso 2: Hay sale_order_id, obtener el vendedor de la orden
+    # CASO 2: Hay sale_order_id, obtener el vendedor de la orden
     elif hasattr(request, "sale_order_id") and request.sale_order_id:
         try:
             order = client.read("sale.order", request.sale_order_id, ["user_id"])
@@ -246,7 +483,8 @@ async def elevenlabs_handoff(request: HandoffRequest):
         except Exception as e:
             print(f"[API Handoff] ⚠️  Error obteniendo vendedor de la orden: {e}")
 
-    # Caso 3: No hay lead ni orden, usar lógica de "vendedor con menos leads"
+    # CASO 3: No hay lead ni orden, usar balanceo de carga
+    # (vendedor con menos leads activos)
     if not assigned_user_id:
         print(f"[API Handoff] 🔍 Buscando vendedor con menos leads...")
         try:
@@ -258,13 +496,13 @@ async def elevenlabs_handoff(request: HandoffRequest):
         except Exception as e:
             print(f"[API Handoff] ⚠️  Error obteniendo vendedor con menos leads: {e}")
 
-    # Obtener el número SMS del vendedor
+    # Obtener el número de WhatsApp del vendedor desde Odoo
     if assigned_user_id:
         vendor_sms = get_user_whatsapp_number(client, assigned_user_id)
-        # Limpiar prefijo whatsapp: si existe
+        # Limpiar prefijo "whatsapp:" si existe
         if vendor_sms and vendor_sms.startswith("whatsapp:"):
             vendor_sms = vendor_sms.replace("whatsapp:", "")
-        # Validar que el número no tenga 'X' (número oculto por privacidad en dev)
+        # Validar que el número no esté oculto por privacidad
         if vendor_sms and ("X" in vendor_sms or "x" in vendor_sms):
             print(
                 f"[API Handoff] ⚠️  Número del vendedor oculto por privacidad, usando default"
@@ -277,18 +515,19 @@ async def elevenlabs_handoff(request: HandoffRequest):
     else:
         print(f"[API Handoff] ⚠️  No se asignó vendedor, usando número default")
 
+    # Enviar notificación SMS/WhatsApp
     result = sms_client.send_handoff_notification(
         user_phone=request.user_phone,
         reason=request.reason,
-        to_number=vendor_sms,  # Pasar el número seleccionado
+        to_number=vendor_sms,  # Número del vendedor o default
         user_name=request.user_name,
         conversation_id=request.conversation_id,
         additional_context=request.additional_context,
-        assigned_user_id=assigned_user_id,  # Pasar ID del vendedor para el mensaje
+        assigned_user_id=assigned_user_id,
     )
 
+    # Si hubo error, registrar en logs y lanzar excepción
     if result["status"] == "error":
-        # Log error handoff
         try:
             from datetime import datetime
             import uuid
@@ -317,7 +556,7 @@ async def elevenlabs_handoff(request: HandoffRequest):
 
         raise HTTPException(status_code=500, detail=result["message"])
 
-    # Log successful handoff
+    # Registrar handoff exitoso en logs
     try:
         from datetime import datetime
         import uuid
@@ -351,10 +590,27 @@ async def elevenlabs_handoff(request: HandoffRequest):
     }
 
 
-# -----------------------------
-# Main
-# -----------------------------
+# ═══════════════════════════════════════════════════════════════════════
+# MAIN - PUNTO DE ENTRADA
+# ═══════════════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
+    """
+    Punto de entrada del servidor.
+
+    Imprime información útil y lanza el servidor con uvicorn.
+
+    CONFIGURACIÓN:
+        - Host: Definido en Config.HOST (default: 0.0.0.0)
+        - Puerto: Definido en Config.PORT (default: 8000)
+        - Reload: Desactivado para producción
+
+    ENDPOINTS DISPONIBLES:
+        - MCP Protocol: http://localhost:8000/mcp
+        - SSE Stream: http://localhost:8000/mcp/sse
+        - API Docs: http://localhost:8000/docs
+        - Health: http://localhost:8000/health
+    """
     print("\n" + "=" * 60)
     print("MCP-ODOO Server Híbrido - MCP + REST API")
     print("=" * 60)
