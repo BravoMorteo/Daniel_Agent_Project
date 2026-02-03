@@ -219,6 +219,99 @@ class QuotationLogger:
 
         return log_path if log_path.exists() else None
 
+    def log_sms_handoff(
+        self,
+        handoff_id: str,
+        user_phone: str,
+        reason: str,
+        user_name: Optional[str] = None,
+        conversation_id: Optional[str] = None,
+        additional_context: Optional[str] = None,
+        lead_id: Optional[int] = None,
+        sale_order_id: Optional[int] = None,
+        assigned_user_id: Optional[int] = None,
+        vendor_sms: Optional[str] = None,
+        message_sid: Optional[str] = None,
+        status: str = "success",
+        error: Optional[str] = None,
+    ) -> str:
+        """
+        Registra un handoff de SMS en formato JSON.
+
+        Args:
+            handoff_id: ID único del handoff (timestamp-based)
+            user_phone: Teléfono del cliente
+            reason: Motivo del handoff
+            user_name: Nombre del cliente
+            conversation_id: ID de conversación en ElevenLabs
+            additional_context: Contexto adicional
+            lead_id: ID del lead si existe
+            sale_order_id: ID de la orden si existe
+            assigned_user_id: ID del vendedor asignado
+            vendor_sms: Número SMS del vendedor
+            message_sid: SID del mensaje de Twilio
+            status: Estado (success/error)
+            error: Mensaje de error si falló
+
+        Returns:
+            Path del archivo de log
+        """
+        now = datetime.now()
+        date_str = now.strftime("%Y-%m-%d")
+        timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+
+        log_data = {
+            "handoff_id": handoff_id,
+            "timestamp": timestamp,
+            "date": date_str,
+            "time": now.strftime("%H:%M:%S.%f")[:-3],
+            "type": "sms_handoff",
+            "status": status,
+            "client_info": {
+                "phone": user_phone,
+                "name": user_name,
+                "conversation_id": conversation_id,
+            },
+            "request": {
+                "reason": reason,
+                "additional_context": additional_context,
+                "lead_id": lead_id,
+                "sale_order_id": sale_order_id,
+            },
+            "vendor_assignment": {
+                "user_id": assigned_user_id,
+                "sms_number": vendor_sms,
+                "assignment_method": (
+                    "from_lead"
+                    if lead_id
+                    else "from_order" if sale_order_id else "load_balancing"
+                ),
+            },
+            "notification": {
+                "message_sid": message_sid,
+                "sent_at": timestamp,
+            },
+            "error": error,
+        }
+
+        # Guardar localmente
+        log_filename = f"{date_str}_sms_{handoff_id}.log"
+        log_path = self.log_dir / log_filename
+
+        with open(log_path, "w", encoding="utf-8") as f:
+            json.dump(log_data, f, indent=2, ensure_ascii=False)
+
+        print(f"📝 Log de handoff guardado: {log_path}")
+
+        # Subir a S3 si está habilitado
+        if self.s3_enabled:
+            try:
+                self._upload_to_s3(log_path, log_filename)
+            except Exception as e:
+                print(f"⚠️  Error subiendo handoff log a S3: {e}")
+
+        return str(log_path)
+
     def cleanup_old_logs(self, days: int = 7):
         """
         Elimina logs locales más antiguos que N días.

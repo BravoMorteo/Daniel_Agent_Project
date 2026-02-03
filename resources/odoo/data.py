@@ -199,8 +199,8 @@ def search_partner_by_email(type, email):
         url = "https://pegasuscontrol.odoo.com"
         db = "pegasuscontrol-pegasuscontrol-10820611"
     else:
-        url = "https://pegasuscontrol-dev18-25468489.dev.odoo.com"
-        db = "pegasuscontrol-dev18-25468489"
+        url = "https://pegasuscontrol-test-27700676.dev.odoo.com"
+        db = "pegasuscontrol-test-27700676"
     username = "laria@pegasus.com.mx"
     password = "Pegasus2024."
 
@@ -572,13 +572,13 @@ if __name__ == "__main__":
 
     # reparaciones()
     # field_by_id_sale_order()
-    search_partner_by_email("dev", "andrea@gmail.com")
+    search_partner_by_email("dev", "bradavo26152116@gmail.com")
     print(
         "\n*******************************menos oportunidades****************************************\n"
     )
-    get_salesperson_with_least_opportunities("dev")
-    field_by_id_leads("dev", 27508)
-    print("\n***********************************************************************\n")
+    #get_salesperson_with_least_opportunities("dev")
+    #field_by_id_leads("dev", 27508)
+    #print("\n***********************************************************************\n")
     # get_sales_team_member_ids("dev", "Ventas")
 
     # Validar pricelist
