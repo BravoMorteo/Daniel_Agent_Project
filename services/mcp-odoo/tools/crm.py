@@ -150,16 +150,21 @@ class DevOdooCRMClient:
         import xmlrpc.client
 
         # Configuración específica para DESARROLLO
-        self.url = os.environ.get(
-            "DEV_ODOO_URL", "https://pegasuscontrol-dev18-25468489.dev.odoo.com"
-        ).rstrip("/")
-        self.db = os.environ.get("DEV_ODOO_DB", "pegasuscontrol-dev18-25468489")
-        self.username = os.environ.get("DEV_ODOO_LOGIN")
-        self.password = os.environ.get("DEV_ODOO_API_KEY")
+        # Intentar leer variables DEV_, si no existen, usar ODOO_ as fallback
+        
+        env_url = os.environ.get("DEV_ODOO_URL") or os.environ.get("ODOO_URL")
+        env_db = os.environ.get("DEV_ODOO_DB") or os.environ.get("ODOO_DB")
+        env_user = os.environ.get("DEV_ODOO_LOGIN") or os.environ.get("ODOO_LOGIN")
+        env_key = os.environ.get("DEV_ODOO_API_KEY") or os.environ.get("ODOO_API_KEY") or os.environ.get("ODOO_PASSWORD")
+        
+        self.url = (env_url or "https://pegasuscontrol-dev18-25468489.dev.odoo.com").rstrip("/")
+        self.db = env_db or "pegasuscontrol-dev18-25468489"
+        self.username = env_user
+        self.password = env_key
 
         if not self.username or not self.password:
             raise ValueError(
-                "Faltan credenciales DEV_ODOO_LOGIN o DEV_ODOO_API_KEY en .env"
+                "Faltan credenciales DEV_ODOO_LOGIN o DEV_ODOO_API_KEY (ni ODOO_*) en .env"
             )
 
         # Conexión XML-RPC a desarrollo con allow_none=True para manejar valores None
@@ -1032,3 +1037,148 @@ Ciudad: {params.get('ciudad', 'N/A')}"""
             response["success"] = False  # Para ElevenLabs
 
         return response
+
+    @mcp.tool(
+        name="dev_update_lead_quotation",
+        description="Actualiza un lead existente y su cotización asociada en el ambiente de DESARROLLO.",
+    )
+    def dev_update_lead_quotation(
+        lead_id: int,
+        description: Optional[str] = None,
+        link_quotation_id: Optional[int] = None,
+        unlink_other_quotations: bool = False,
+        products: Optional[List[dict]] = None,
+        replace_products: bool = True,
+    ) -> dict:
+        """
+        Actualiza un lead y su cotización (Sale Order) vinculada.
+
+        Args:
+            lead_id: ID del lead/transacción a actualizar.
+            description: Nueva descripción para el lead (opcional).
+            link_quotation_id: ID de una cotización existente para vincular a este lead.
+            unlink_other_quotations: Si es True y se linkea una cotización, desvincula las otras.
+            products: Lista de productos para actualizar en la cotización.
+                      Format: [{"product_id": int, "qty": float, "price": float}]
+            replace_products: Si es True (default), elimina las líneas existentes en la cotización
+                              antes de agregar las nuevas. Si es False, solo agrega.
+
+        Returns:
+            Dict con el resultado de la actualización.
+        """
+        client = get_odoo_client()
+
+        # 1. Verificar Lead
+        lead = client.read("crm.lead", lead_id, ["id", "name", "partner_id", "type"])
+        if not lead:
+            return {"error": f"Lead {lead_id} no encontrado", "success": False}
+
+        updates = {}
+        if description:
+            updates["description"] = description
+
+        if updates:
+            client.write("crm.lead", lead_id, updates)
+
+        logs = []
+        
+        # 1.5 Vincular cotización si se solicita
+        if link_quotation_id:
+            # Verificar si existe
+            so_check = client.read("sale.order", link_quotation_id, ["id", "name"])
+            if so_check:
+                # Si se solicita desvincular otras
+                if unlink_other_quotations:
+                    # Buscar otras cotizaciones del lead
+                    other_sos = client.search_read(
+                        "sale.order",
+                        [("opportunity_id", "=", lead_id), ("id", "!=", link_quotation_id)],
+                        ["id", "name"]
+                    )
+                    for other in other_sos:
+                        client.write("sale.order", other["id"], {"opportunity_id": False})
+                        logs.append(f"Unlinked Sale Order {other['id']} ({other['name']}) from Lead {lead_id}")
+
+                # Actualizar sale order con el opportunity_id
+                client.write("sale.order", link_quotation_id, {"opportunity_id": lead_id})
+                logs.append(f"Linked existing Sale Order {link_quotation_id} to Lead {lead_id}")
+            else:
+                 logs.append(f"Warning: Sale Order {link_quotation_id} not found to link.")
+
+        # 2. Buscar Sale Order vinculada
+        # En CRM, la orden suele estar linkeada por opportunity_id
+        sale_orders = client.search_read(
+            "sale.order",
+            [("opportunity_id", "=", lead_id), ("state", "in", ["draft", "sent"])],
+            ["id", "name", "order_line"],
+        )
+
+        sale_order_id = None
+        sale_order_name = None
+        products_updated = False
+        log_msgs = logs # Start with logs from linking
+
+        if sale_orders:
+            sale_order = sale_orders[0]
+            sale_order_id = sale_order["id"]
+            sale_order_name = sale_order["name"]
+
+            if products:
+                # 1. Si replace_products, eliminar existentes primero
+                if replace_products:
+                    # Usar (5, 0, 0) o (6, 0, []) para limpiar líneas
+                    client.write("sale.order", sale_order_id, {"order_line": [(5, 0, 0)]})
+
+                # 2. Agregar nuevos productos uno por uno (más robusto para precios)
+                for prod in products:
+                    pid = prod.get("product_id")
+                    qty = prod.get("qty", 1.0)
+                    price = prod.get("price", -1.0)
+
+                    line_values = {
+                        "order_id": sale_order_id,
+                        "product_id": pid,
+                        "product_uom_qty": qty,
+                    }
+
+                    # Obtener precio base
+                    price_to_set = -1.0
+                    if price > 0:
+                        line_values["price_unit"] = price
+                        price_to_set = price
+                    else:
+                        # Intentar obtener precio de lista
+                        try:
+                            product_data = client.read(
+                                "product.product", pid, ["list_price"]
+                            )
+                            if product_data:
+                                list_price = product_data.get("list_price", 0.0)
+                                line_values["price_unit"] = list_price
+                                price_to_set = list_price
+                        except Exception as e:
+                            log_msgs.append(f"Error fetching price for {pid}: {e}")
+
+                    # Crear línea
+                    line_id = client.create("sale.order.line", line_values)
+                    
+                    # 3. Forzar precio si se especificó (para evitar recalculo de Odoo)
+                    if price > 0:
+                         try:
+                             client.write("sale.order.line", line_id, {"price_unit": price})
+                         except Exception as e:
+                             log_msgs.append(f"Error forcing price for line {line_id}: {e}")
+
+                products_updated = True
+        else:
+            log_msgs.append("No active sale order found for this lead")
+
+        return {
+            "success": True,
+            "lead_id": lead_id,
+            "lead_updated": bool(updates),
+            "sale_order_id": sale_order_id,
+            "sale_order_name": sale_order_name,
+            "products_updated": products_updated,
+            "logs": log_msgs,
+        }
