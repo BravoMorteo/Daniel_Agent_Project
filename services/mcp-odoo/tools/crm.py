@@ -212,8 +212,30 @@ class DevOdooCRMClient:
         return result[0] if result else {}
 
     def action_set_won(self, lead_id: int) -> bool:
-        """Marca una oportunidad como ganada."""
-        return self.execute_kw("crm.lead", "action_set_won", [[lead_id]])
+        """Marca una oportunidad como ganada usando action_set_won_rainbowman."""
+        return self.execute_kw("crm.lead", "action_set_won_rainbowman", [[lead_id]])
+
+    def action_set_lost(self, lead_id: int, lost_reason_id: int = None) -> bool:
+        """Marca una oportunidad como perdida escribiendo los campos directamente.
+        
+        Nota: No se puede usar el método action_set_lost de Odoo via XML-RPC
+        porque retorna None y el marshaller del servidor no puede serializar None.
+        """
+        values = {
+            "active": False,
+            "probability": 0,
+        }
+        if lost_reason_id is not None:
+            values["lost_reason_id"] = lost_reason_id
+        return self.execute_kw("crm.lead", "write", [[lead_id], values])
+
+    def message_post(self, model: str, record_id: int, body: str, subtype_xmlid: str = "mail.mt_note") -> int:
+        """Publica un mensaje/nota interna en un registro."""
+        return self.execute_kw(
+            model, "message_post",
+            [[record_id]],
+            {"body": body, "subtype_xmlid": subtype_xmlid}
+        )
 
     def get_salesperson_with_least_opportunities(self) -> int | None:
         """
@@ -1040,83 +1062,148 @@ Ciudad: {params.get('ciudad', 'N/A')}"""
 
     @mcp.tool(
         name="dev_update_lead_quotation",
-        description="Actualiza un lead existente y su cotización asociada en el ambiente de DESARROLLO.",
+        description="Actualiza un lead/oportunidad existente en el ambiente de DESARROLLO. Soporta: actualizar descripción, convertir a oportunidad, publicar mensajes internos, marcar como ganada/perdida, vincular cotizaciones y gestionar productos. Cada operación es independiente.",
     )
     def dev_update_lead_quotation(
         lead_id: int,
         description: Optional[str] = None,
+        message: Optional[str] = None,
+        mark_as_won: bool = False,
+        mark_as_lost: bool = False,
+        lost_reason_id: Optional[int] = None,
         link_quotation_id: Optional[int] = None,
         unlink_other_quotations: bool = False,
         products: Optional[List[dict]] = None,
         replace_products: bool = True,
+        convert_to_opportunity: bool = False,
     ) -> dict:
         """
-        Actualiza un lead y su cotización (Sale Order) vinculada.
+        Actualiza un lead y/o su cotización (Sale Order) vinculada.
+        Cada parámetro actúa de forma INDEPENDIENTE.
 
         Args:
-            lead_id: ID del lead/transacción a actualizar.
-            description: Nueva descripción para el lead (opcional).
+            lead_id: ID del lead/oportunidad a actualizar.
+            description: Nueva descripción (notas internas) para el lead.
+            message: Mensaje/nota interna a publicar en el chatter del lead.
+            mark_as_won: Marca la oportunidad como ganada (solo si type=opportunity).
+            mark_as_lost: Marca la oportunidad como perdida (solo si type=opportunity).
+            lost_reason_id: ID de la razón de pérdida (crm.lost.reason). Ejemplos: 4=Falta de presupuesto, 16=No interesado, 6=Mejor oferta.
             link_quotation_id: ID de una cotización existente para vincular a este lead.
             unlink_other_quotations: Si es True y se linkea una cotización, desvincula las otras.
             products: Lista de productos para actualizar en la cotización.
                       Format: [{"product_id": int, "qty": float, "price": float}]
             replace_products: Si es True (default), elimina las líneas existentes en la cotización
                               antes de agregar las nuevas. Si es False, solo agrega.
+            convert_to_opportunity: Si es True, convierte el lead a oportunidad si aún no lo es.
+                                    Si se proporciona link_quotation_id, se fuerza a True automáticamente.
 
         Returns:
             Dict con el resultado de la actualización.
         """
         client = get_odoo_client()
+        logs = []
 
-        # 1. Verificar Lead
+        # ── 0. Validación: won y lost son mutuamente excluyentes ──
+        if mark_as_won and mark_as_lost:
+            return {
+                "error": "Cannot mark as both won AND lost. Choose one.",
+                "success": False,
+            }
+
+        # ── 1. Verificar Lead ──
         lead = client.read("crm.lead", lead_id, ["id", "name", "partner_id", "type"])
         if not lead:
             return {"error": f"Lead {lead_id} no encontrado", "success": False}
 
+        # ── 2. INDEPENDENT: Actualizar descripción ──
         updates = {}
         if description:
             updates["description"] = description
 
+        # ── 3. INDEPENDENT: Conversión a oportunidad ──
+        should_convert = convert_to_opportunity or (link_quotation_id is not None)
+
+        if should_convert and lead["type"] != "opportunity":
+            from datetime import datetime
+
+            updates["type"] = "opportunity"
+            updates["date_conversion"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
         if updates:
             client.write("crm.lead", lead_id, updates)
+            if description:
+                logs.append(f"Description updated for Lead {lead_id}")
+            if "type" in updates and updates["type"] == "opportunity":
+                logs.append(f"Lead {lead_id} converted to Opportunity")
+                # Refresh the lead type after conversion
+                lead["type"] = "opportunity"
 
-        logs = []
-        
-        # 1.5 Vincular cotización si se solicita
+        # ── 4. INDEPENDENT: Publicar mensaje interno ──
+        message_posted = False
+        if message:
+            try:
+                msg_id = client.message_post("crm.lead", lead_id, body=message)
+                logs.append(f"Message posted on Lead {lead_id} (message_id: {msg_id})")
+                message_posted = True
+            except Exception as e:
+                logs.append(f"Error posting message on Lead {lead_id}: {e}")
+
+        # ── 5. INDEPENDENT: Marcar como ganada ──
+        marked_won = False
+        if mark_as_won:
+            if lead["type"] != "opportunity":
+                logs.append(f"Cannot mark as won: Lead {lead_id} is not an opportunity (type={lead['type']})")
+            else:
+                try:
+                    client.action_set_won(lead_id)
+                    logs.append(f"Opportunity {lead_id} marked as WON")
+                    marked_won = True
+                except Exception as e:
+                    logs.append(f"Error marking as won: {e}")
+
+        # ── 6. INDEPENDENT: Marcar como perdida ──
+        marked_lost = False
+        if mark_as_lost:
+            if lead["type"] != "opportunity":
+                logs.append(f"Cannot mark as lost: Lead {lead_id} is not an opportunity (type={lead['type']})")
+            else:
+                try:
+                    client.action_set_lost(lead_id, lost_reason_id=lost_reason_id)
+                    reason_info = f" (reason_id={lost_reason_id})" if lost_reason_id else ""
+                    logs.append(f"Opportunity {lead_id} marked as LOST{reason_info}")
+                    marked_lost = True
+                except Exception as e:
+                    logs.append(f"Error marking as lost: {e}")
+
+        # ── 7. INDEPENDENT: Vincular cotización ──
         if link_quotation_id:
-            # Verificar si existe
             so_check = client.read("sale.order", link_quotation_id, ["id", "name"])
             if so_check:
-                # Si se solicita desvincular otras
                 if unlink_other_quotations:
-                    # Buscar otras cotizaciones del lead
                     other_sos = client.search_read(
                         "sale.order",
                         [("opportunity_id", "=", lead_id), ("id", "!=", link_quotation_id)],
-                        ["id", "name"]
+                        ["id", "name"],
                     )
                     for other in other_sos:
                         client.write("sale.order", other["id"], {"opportunity_id": False})
                         logs.append(f"Unlinked Sale Order {other['id']} ({other['name']}) from Lead {lead_id}")
 
-                # Actualizar sale order con el opportunity_id
                 client.write("sale.order", link_quotation_id, {"opportunity_id": lead_id})
                 logs.append(f"Linked existing Sale Order {link_quotation_id} to Lead {lead_id}")
             else:
-                 logs.append(f"Warning: Sale Order {link_quotation_id} not found to link.")
+                logs.append(f"Warning: Sale Order {link_quotation_id} not found to link.")
 
-        # 2. Buscar Sale Order vinculada
-        # En CRM, la orden suele estar linkeada por opportunity_id
+        # ── 8. INDEPENDENT: Gestión de productos en cotización ──
+        sale_order_id = None
+        sale_order_name = None
+        products_updated = False
+
         sale_orders = client.search_read(
             "sale.order",
             [("opportunity_id", "=", lead_id), ("state", "in", ["draft", "sent"])],
             ["id", "name", "order_line"],
         )
-
-        sale_order_id = None
-        sale_order_name = None
-        products_updated = False
-        log_msgs = logs # Start with logs from linking
 
         if sale_orders:
             sale_order = sale_orders[0]
@@ -1124,12 +1211,9 @@ Ciudad: {params.get('ciudad', 'N/A')}"""
             sale_order_name = sale_order["name"]
 
             if products:
-                # 1. Si replace_products, eliminar existentes primero
                 if replace_products:
-                    # Usar (5, 0, 0) o (6, 0, []) para limpiar líneas
                     client.write("sale.order", sale_order_id, {"order_line": [(5, 0, 0)]})
 
-                # 2. Agregar nuevos productos uno por uno (más robusto para precios)
                 for prod in products:
                     pid = prod.get("product_id")
                     qty = prod.get("qty", 1.0)
@@ -1141,13 +1225,9 @@ Ciudad: {params.get('ciudad', 'N/A')}"""
                         "product_uom_qty": qty,
                     }
 
-                    # Obtener precio base
-                    price_to_set = -1.0
                     if price > 0:
                         line_values["price_unit"] = price
-                        price_to_set = price
                     else:
-                        # Intentar obtener precio de lista
                         try:
                             product_data = client.read(
                                 "product.product", pid, ["list_price"]
@@ -1155,30 +1235,31 @@ Ciudad: {params.get('ciudad', 'N/A')}"""
                             if product_data:
                                 list_price = product_data.get("list_price", 0.0)
                                 line_values["price_unit"] = list_price
-                                price_to_set = list_price
                         except Exception as e:
-                            log_msgs.append(f"Error fetching price for {pid}: {e}")
+                            logs.append(f"Error fetching price for {pid}: {e}")
 
-                    # Crear línea
                     line_id = client.create("sale.order.line", line_values)
-                    
-                    # 3. Forzar precio si se especificó (para evitar recalculo de Odoo)
+
                     if price > 0:
-                         try:
-                             client.write("sale.order.line", line_id, {"price_unit": price})
-                         except Exception as e:
-                             log_msgs.append(f"Error forcing price for line {line_id}: {e}")
+                        try:
+                            client.write("sale.order.line", line_id, {"price_unit": price})
+                        except Exception as e:
+                            logs.append(f"Error forcing price for line {line_id}: {e}")
 
                 products_updated = True
-        else:
-            log_msgs.append("No active sale order found for this lead")
+        elif products:
+            logs.append("No active sale order found for this lead to update products")
 
         return {
             "success": True,
             "lead_id": lead_id,
             "lead_updated": bool(updates),
+            "message_posted": message_posted,
+            "marked_won": marked_won,
+            "marked_lost": marked_lost,
             "sale_order_id": sale_order_id,
             "sale_order_name": sale_order_name,
             "products_updated": products_updated,
-            "logs": log_msgs,
+            "logs": logs,
         }
+
