@@ -512,6 +512,13 @@ def register(mcp, deps: dict):
         update_lead_data: Optional[dict] = None,
         description: Optional[str] = None,
         x_studio_producto: Optional[int] = None,
+        # Nuevos parámetros directos para facilitar el uso
+        partner_name: Optional[str] = None,
+        contact_name: Optional[str] = None,
+        email: Optional[str] = None,
+        phone: Optional[str] = None,
+        ciudad: Optional[str] = None,
+        lead_name: Optional[str] = None,
     ) -> dict:
         """
         Actualiza un lead EXISTENTE y crea una cotización a partir de él.
@@ -520,9 +527,10 @@ def register(mcp, deps: dict):
         - Separada de dev_create_quotation para claridad
         - Usa QuotationService compartido
         - Retorna tracking_id para seguimiento asíncrono
+        - Acepta parámetros directos o update_lead_data
 
         DIFERENCIAS vs dev_create_quotation:
-        - ❌ NO crea partner nuevo
+        - ❌ NO crea partner nuevo (pero puede buscarlo/crearlo si se proporciona partner_name)
         - ❌ NO crea lead nuevo
         - ✅ Lee lead existente
         - ✅ Actualiza campos del lead (opcional)
@@ -532,9 +540,10 @@ def register(mcp, deps: dict):
         Flujo (ejecutado en background):
         1. Lee lead existente por lead_id
         2. Actualiza campos del lead (opcional)
-        3. Convierte a oportunidad (si no lo es)
-        4. Crea orden de venta
-        5. Agrega productos
+        3. Si partner_name está presente, busca/crea el partner
+        4. Convierte a oportunidad (si no lo es)
+        5. Crea orden de venta
+        6. Agrega productos
 
         Args:
             lead_id: ID del lead existente (OBLIGATORIO, debe ser > 0)
@@ -542,22 +551,41 @@ def register(mcp, deps: dict):
             product_id: ID del producto [LEGACY]
             product_qty: Cantidad [LEGACY]
             product_price: Precio manual [LEGACY]
-            update_lead_data: Dict con campos a actualizar
-                Ejemplo: {"description": "Nuevo texto", "city": "CDMX", "priority": 3}
+            update_lead_data: Dict con campos a actualizar (opcional)
             description: Descripción adicional
             x_studio_producto: Producto principal (Many2one)
+
+            # Parámetros directos (se convierten automáticamente a update_lead_data):
+            partner_name: Nombre del partner (se busca/crea automáticamente)
+            contact_name: Nombre del contacto
+            email: Email del contacto
+            phone: Teléfono del contacto
+            ciudad: Ciudad
+            lead_name: Nombre del lead
 
         Returns:
             dict con tracking_id, status, mode="update", lead_id, message
 
-        Ejemplo:
+        Ejemplo 1 (usando parámetros directos):
+            dev_update_lead_quotation(
+                lead_id=31727,
+                partner_name="Petco",
+                contact_name="Alejandro Bravo",
+                email="abravopc@corporativosade.com.mx",
+                phone="1231231212",
+                ciudad="Jalisco",
+                lead_name="Servibot - Cotización PuduBot 2",
+                products=[{"product_id": 26156, "qty": 4, "price": -1}],
+                description="Actualización de cotización: 4 unidades de PuduBot 2"
+            )
+
+        Ejemplo 2 (usando update_lead_data):
             dev_update_lead_quotation(
                 lead_id=12345,
-                products=[
-                    {"product_id": 26156, "qty": 5, "price": 9000.0}
-                ],
+                products=[{"product_id": 26156, "qty": 5, "price": 9000.0}],
                 update_lead_data={
-                    "description": "Cliente solicitó cambio de cantidad",
+                    "partner_name": "Petco",
+                    "city": "CDMX",
                     "priority": "2"
                 }
             )
@@ -568,6 +596,24 @@ def register(mcp, deps: dict):
                 "error": "lead_id es obligatorio y debe ser mayor a 0",
                 "example": "dev_update_lead_quotation(lead_id=12345, products=[...])",
             }
+
+        # Construir update_lead_data automáticamente desde parámetros directos
+        if update_lead_data is None:
+            update_lead_data = {}
+
+        # Agregar parámetros directos a update_lead_data si están presentes
+        if partner_name:
+            update_lead_data["partner_name"] = partner_name
+        if contact_name:
+            update_lead_data["contact_name"] = contact_name
+        if email:
+            update_lead_data["email_from"] = normalize_email(email)
+        if phone:
+            update_lead_data["phone"] = phone
+        if ciudad:
+            update_lead_data["city"] = ciudad
+        if lead_name:
+            update_lead_data["name"] = lead_name
 
         # Importar servicio
         from core.quotation_service import QuotationService
@@ -585,7 +631,7 @@ def register(mcp, deps: dict):
             product_id=product_id,
             product_qty=product_qty,
             product_price=product_price,
-            update_lead_data=update_lead_data,
+            update_lead_data=update_lead_data if update_lead_data else None,
             description=description,
             x_studio_producto=x_studio_producto,
         )

@@ -142,6 +142,7 @@ class QuotationService:
             tracking_id=tracking_id,
             input_data=params,
             status="queued",
+            mode="create",
         )
 
         print(f"🆔 Tracking ID: {tracking_id}")
@@ -228,6 +229,7 @@ class QuotationService:
             tracking_id=tracking_id,
             input_data=params,
             status="queued",
+            mode="update",
         )
 
         print(f"🆔 Tracking ID: {tracking_id}")
@@ -512,6 +514,19 @@ class QuotationService:
             user_info = lead.get("user_id")
             user_id = user_info[0] if user_info else None
             lead_name = lead.get("name", "Cotización desde lead existente")
+
+            # Si no hay user_id asignado, asignar uno automáticamente (balanceo de carga)
+            if not user_id:
+                print(f"⚠️ Lead sin vendedor asignado, asignando automáticamente...")
+                from core.helpers import get_available_vendor_with_least_leads
+
+                user_id = get_available_vendor_with_least_leads(self.client)
+                if user_id:
+                    # Asignar vendedor al lead
+                    self.client.write("crm.lead", lead_id, {"user_id": user_id})
+                    print(f"✅ Vendedor asignado automáticamente: {user_id}")
+                else:
+                    print(f"⚠️ No se pudo asignar vendedor automáticamente")
 
             if not partner_id:
                 raise ValueError(f"El lead {lead_id} no tiene un partner asociado.")

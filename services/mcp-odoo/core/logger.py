@@ -70,6 +70,7 @@ class QuotationLogger:
         output_data: Optional[Dict[str, Any]] = None,
         status: str = "started",
         error: Optional[str] = None,
+        mode: Optional[str] = None,
     ) -> str:
         """
         Registra una cotización en formato JSON.
@@ -80,6 +81,7 @@ class QuotationLogger:
             output_data: Datos de salida (None si aún no hay)
             status: Estado (started, processing, completed, failed)
             error: Mensaje de error si falló
+            mode: Modo de operación ("create" o "update")
 
         Returns:
             Ruta del archivo de log
@@ -91,6 +93,7 @@ class QuotationLogger:
             "date": timestamp.strftime("%Y-%m-%d"),
             "time": timestamp.strftime("%H:%M:%S.%f")[:-3],
             "status": status,
+            "mode": mode,
             "input": input_data,
             "output": output_data,
             "error": error,
