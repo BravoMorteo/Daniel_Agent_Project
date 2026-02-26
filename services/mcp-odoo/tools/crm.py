@@ -348,23 +348,21 @@ def register(mcp, deps: dict):
         x_studio_producto: Optional[int] = None,
     ) -> dict:
         """
-        Crea una cotización de forma ASÍNCRONA usando la infraestructura de FastAPI.
+        Crea una cotización completa DESDE CERO de forma ASÍNCRONA.
 
-        NUEVO COMPORTAMIENTO:
-        - Crea tarea en TaskManager
-        - Ejecuta proceso en background
-        - Registra logs en JSON + S3
+        ✨ NUEVA ARQUITECTURA (Service Layer Pattern):
+        - Usa QuotationService para lógica de negocio
+        - Elimina código duplicado con endpoints HTTP
         - Retorna tracking_id inmediatamente
-        - LLM puede consultar estado con dev_get_quotation_status()
-        - Soporta múltiples productos mediante el parámetro 'products'
+        - LLM consulta estado con dev_get_quotation_status()
 
         Flujo completo (ejecutado en background):
-        1. Verifica si existe el partner (res.partner) por email, si no existe lo crea
-        2. Asigna vendedor automáticamente si no se especifica (balanceo de carga)
-        3. Crea un lead (crm.lead) tipo 'lead' con campos personalizados
-        4. Convierte el lead a oportunidad
-        5. Genera cotización/orden de venta
-        6. Agrega líneas de productos (soporta múltiples productos)
+        1. Verifica/crea partner por email
+        2. Asigna vendedor automáticamente (balanceo)
+        3. Crea lead nuevo
+        4. Convierte a oportunidad
+        5. Genera orden de venta
+        6. Agrega productos
 
         Args:
             partner_name: Nombre del cliente/empresa
@@ -374,585 +372,53 @@ def register(mcp, deps: dict):
             lead_name: Nombre del lead/oportunidad
             ciudad: Ciudad del contacto (opcional)
             user_id: ID del vendedor (0 = asignación automática)
-            product_id: ID del producto (0 = sin producto) [LEGACY - usar 'products']
-            product_qty: Cantidad del producto [LEGACY - usar 'products']
-            product_price: Precio manual (-1.0 = automático) [LEGACY - usar 'products']
-            products: Lista de productos con formato [{"product_id": int, "qty": float, "price": float}]
-            description: Descripción personalizada para el lead
-            x_studio_producto: ID del producto principal (Many2one). Si se omite, se asigna automáticamente el primer producto
+            product_id: ID del producto [LEGACY]
+            product_qty: Cantidad [LEGACY]
+            product_price: Precio manual [LEGACY]
+            products: Lista [{"product_id": int, "qty": float, "price": float}]
+            description: Descripción del lead
+            x_studio_producto: Producto principal (Many2one)
 
         Returns:
-            dict con tracking_id, status, message, estimated_time
+            dict con tracking_id, status, mode="create", message
 
-        Ejemplo retorno:
-            {
-                "tracking_id": "quot_abc123",
-                "status": "queued",
-                "message": "Cotización creada en cola de procesamiento",
-                "estimated_time": "20-30 segundos",
-                "info": "Usa dev_get_quotation_status(tracking_id) para consultar estado"
-            }
-
-        Ejemplo con múltiples productos:
+        Ejemplo:
             dev_create_quotation(
                 partner_name="ACME Corp",
                 contact_name="John Doe",
                 email="john@acme.com",
                 phone="+1234567890",
-                lead_name="Restaurant Equipment Quote",
+                lead_name="Restaurant Equipment",
                 products=[
-                    {"product_id": 26156, "qty": 10, "price": 9350.0},
-                    {"product_id": 26153, "qty": 20, "price": 8500.0}
-                ],
-                description="Equipment for new restaurant location"
+                    {"product_id": 26156, "qty": 10, "price": 9350.0}
+                ]
             )
         """
-        import uuid
-        import threading
+        # Importar servicio
+        from core.quotation_service import QuotationService
 
-        # Importar TaskManager y Logger
-        from core.tasks import task_manager
-        from core.logger import quotation_logger
+        # Obtener cliente Odoo
+        client = get_odoo_client()
 
-        # Generar tracking_id único
-        tracking_id = f"quot_{uuid.uuid4().hex[:12]}"
+        # Crear servicio
+        service = QuotationService(client)
 
-        # Preparar parámetros
-        params = {
-            "partner_name": partner_name,
-            "contact_name": contact_name,
-            "email": email,
-            "phone": phone,
-            "lead_name": lead_name,
-            "ciudad": ciudad,
-            "user_id": user_id,
-            "product_id": product_id,
-            "product_qty": product_qty,
-            "product_price": product_price,
-            "products": products,
-            "description": description,
-            "x_studio_producto": x_studio_producto,
-        }
-
-        # Crear tarea en TaskManager
-        task_manager.create_task(tracking_id, params)
-
-        # Log inicial
-        quotation_logger.log_quotation(
-            tracking_id=tracking_id, input_data=params, status="started"
+        # Delegar al servicio
+        return service.create_from_scratch(
+            partner_name=partner_name,
+            contact_name=contact_name,
+            email=email,
+            phone=phone,
+            lead_name=lead_name,
+            ciudad=ciudad,
+            user_id=user_id,
+            product_id=product_id,
+            product_qty=product_qty,
+            product_price=product_price,
+            products=products,
+            description=description,
+            x_studio_producto=x_studio_producto,
         )
-
-        # Lanzar proceso en background (thread separado)
-        def execute_quotation_background():
-            """Ejecuta el proceso completo en background"""
-            task = task_manager.get_task(tracking_id)
-            if not task:
-                return
-
-            try:
-                task.start()
-                task.update_progress("Iniciando cliente Odoo...")
-
-                client = get_odoo_client()  # Usa el cliente según ODOO_ENVIRONMENT
-
-                # Verificar conexión de Odoo con retry mejorado
-                max_retries = 4
-                retry_delays = [3, 5, 10]  # Delays progresivos en segundos
-
-                for attempt in range(max_retries):
-                    try:
-                        # Test de conexión simple
-                        client.search_read("res.partner", [], ["id"], limit=1)
-                        if attempt > 0:
-                            print(f"✅ Conexión Odoo exitosa en intento {attempt + 1}")
-                        break
-                    except Exception as conn_error:
-                        error_type = type(conn_error).__name__
-                        if attempt < max_retries - 1:
-                            delay = (
-                                retry_delays[attempt]
-                                if attempt < len(retry_delays)
-                                else 10
-                            )
-                            print(
-                                f"⚠️ Intento {attempt + 1}/{max_retries} falló ({error_type}), esperando {delay}s..."
-                            )
-                            import time
-
-                            time.sleep(delay)
-                        else:
-                            raise Exception(
-                                f"Odoo connection failed after {max_retries} attempts: {str(conn_error)[:200]}"
-                            )
-
-                steps = {}
-
-                # PASO 1: Verificar/Crear Partner
-                task.update_progress("Verificando partner...")
-
-                # Validar y normalizar email
-                try:
-                    email_normalizado = normalize_email(email)
-                except ValueError as email_error:
-                    raise Exception(f"Email inválido: {str(email_error)}")
-
-                existing_partners = client.search_read(
-                    "res.partner",
-                    [("email", "=", email_normalizado)],
-                    ["id", "name", "email", "phone"],
-                    limit=1,
-                )
-
-                if existing_partners:
-                    partner_id = existing_partners[0]["id"]
-                    partner_full_name = existing_partners[0]["name"]
-                    steps["partner"] = (
-                        f"Partner existente: {partner_full_name} (ID: {partner_id})"
-                    )
-                else:
-                    partner_values = {
-                        "name": contact_name,
-                        "email": email_normalizado,
-                        "phone": phone,
-                        "is_company": False,
-                        "type": "contact",
-                    }
-                    # Agregar ciudad si se proporciona
-                    if ciudad:
-                        partner_values["city"] = ciudad
-
-                    partner_id = client.create("res.partner", partner_values)
-                    partner_full_name = partner_name
-                    steps["partner"] = (
-                        f"Nuevo partner creado: {partner_full_name} (ID: {partner_id})"
-                    )
-
-                task.update_progress("Partner verificado")
-
-                # PASO 2: Asignar vendedor
-                task.update_progress("Asignando vendedor...")
-                assigned_user_id = user_id
-                if not assigned_user_id:
-                    assigned_user_id = client.get_salesperson_with_least_opportunities()
-                    if assigned_user_id:
-                        steps["user"] = (
-                            f"Vendedor asignado automáticamente (ID: {assigned_user_id})"
-                        )
-                    else:
-                        steps["user"] = "Sin vendedor asignado"
-                else:
-                    steps["user"] = f"Vendedor manual (ID: {assigned_user_id})"
-
-                task.update_progress("Vendedor asignado")
-
-                # PASO 3: Crear Lead
-                task.update_progress("Creando lead...")
-                lead_values = {
-                    "name": lead_name,
-                    "partner_name": partner_name,
-                    "contact_name": contact_name,
-                    "phone": phone,
-                    "email_from": email_normalizado,
-                    "type": "lead",
-                    "partner_id": partner_id,
-                }
-                if assigned_user_id:
-                    lead_values["user_id"] = assigned_user_id
-
-                # Agregar campos personalizados
-                if description:
-                    lead_values["description"] = description
-
-                # Auto-asignación de x_studio_producto (similar a core/api.py)
-                if x_studio_producto:
-                    lead_values["x_studio_producto"] = x_studio_producto
-                elif products and len(products) > 0:
-                    # Auto-asignar el primer producto del array
-                    lead_values["x_studio_producto"] = products[0].get("product_id")
-                elif product_id > 0:
-                    # Legacy: asignar desde product_id
-                    lead_values["x_studio_producto"] = product_id
-
-                lead_id = client.create("crm.lead", lead_values)
-                steps["lead"] = f"Lead creado: {lead_name} (ID: {lead_id})"
-                task.update_progress("Lead creado")
-
-                # PASO 4: Convertir a Oportunidad
-                task.update_progress("Convirtiendo a oportunidad...")
-                from datetime import datetime
-
-                conversion_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                opportunity_values = {
-                    "type": "opportunity",
-                    "date_conversion": conversion_date,
-                    "stage_id": 3,
-                }
-                if assigned_user_id:
-                    opportunity_values["user_id"] = assigned_user_id
-
-                client.write("crm.lead", lead_id, opportunity_values)
-                steps["opportunity"] = f"Convertido a oportunidad (ID: {lead_id})"
-                task.update_progress("Oportunidad creada")
-
-                # PASO 5: Crear Sale Order
-                task.update_progress("Creando cotización...")
-                sale_values = {
-                    "partner_id": partner_id,
-                    "opportunity_id": lead_id,
-                    "origin": lead_name,
-                    "note": f"<p>Cotización desde oportunidad: {lead_name}</p>",
-                }
-                if assigned_user_id:
-                    sale_values["user_id"] = assigned_user_id
-
-                sale_order_id = client.create("sale.order", sale_values)
-                sale_data = client.read("sale.order", sale_order_id, ["name"])
-                sale_order_name = sale_data.get("name", f"S{sale_order_id}")
-                steps["sale_order"] = (
-                    f"Cotización: {sale_order_name} (ID: {sale_order_id})"
-                )
-                task.update_progress("Cotización creada")
-
-                # PASO 6: Agregar productos (soporta múltiples productos)
-                products_added = []
-
-                # Determinar qué productos agregar
-                products_to_add = []
-                if products and len(products) > 0:
-                    # Usar el nuevo formato de productos array
-                    for p in products:
-                        products_to_add.append(
-                            {
-                                "product_id": p.get("product_id"),
-                                "qty": p.get("qty", 1.0),
-                                "price": p.get("price", -1.0),
-                            }
-                        )
-                elif product_id > 0:
-                    # Legacy: usar product_id, product_qty, product_price
-                    products_to_add.append(
-                        {
-                            "product_id": product_id,
-                            "qty": product_qty,
-                            "price": product_price,
-                        }
-                    )
-
-                # Agregar cada producto
-                for idx, product_data in enumerate(products_to_add, 1):
-                    task.update_progress(
-                        f"Agregando producto {idx}/{len(products_to_add)}..."
-                    )
-
-                    pid = product_data["product_id"]
-                    qty = product_data["qty"]
-                    price = product_data["price"]
-
-                    line_values = {
-                        "order_id": sale_order_id,
-                        "product_id": pid,
-                        "product_uom_qty": qty,
-                    }
-
-                    if price > 0:
-                        line_values["price_unit"] = price
-                        price_info = f"${price}"
-                    else:
-                        pricelist_id = 82
-                        product_data_read = client.read(
-                            "product.product", pid, ["name"]
-                        )
-                        product_name = product_data_read.get("name", "Unknown")
-
-                        pricelist_items = client.search_read(
-                            "product.pricelist.item",
-                            [
-                                ["pricelist_id", "=", pricelist_id],
-                                ["product_id", "=", pid],
-                            ],
-                            ["fixed_price"],
-                        )
-
-                        if pricelist_items:
-                            pricelist_price = pricelist_items[0].get("fixed_price", 0.0)
-                            line_values["price_unit"] = pricelist_price
-                            price_info = f"${pricelist_price}"
-                        else:
-                            product_data_full = client.read(
-                                "product.product", pid, ["list_price"]
-                            )
-                            auto_price = product_data_full.get("list_price", 0.0)
-                            line_values["price_unit"] = auto_price
-                            price_info = f"${auto_price}"
-
-                    line_id = client.create("sale.order.line", line_values)
-
-                    # Agregar a la lista de productos agregados
-                    products_added.append(
-                        {
-                            "product_id": pid,
-                            "qty": qty,
-                            "price": line_values.get("price_unit", 0.0),
-                            "line_id": line_id,
-                        }
-                    )
-
-                    if idx == 1:
-                        steps["products"] = (
-                            f"Producto 1: ID {pid} x {qty} = {price_info}"
-                        )
-                    else:
-                        steps[
-                            "products"
-                        ] += f" | Producto {idx}: ID {pid} x {qty} = {price_info}"
-
-                if products_added:
-                    task.update_progress(
-                        f"{len(products_added)} producto(s) agregado(s)"
-                    )
-
-                # Leer el lead actualizado para obtener los campos finales
-                lead_final = client.read(
-                    "crm.lead", lead_id, ["description", "x_studio_producto"]
-                )
-
-                # Enviar notificación SMS al vendedor
-                notification_data = None
-                try:
-                    from core.whatsapp import sms_client
-                    from core.helpers import get_user_whatsapp_number
-                    from datetime import datetime
-
-                    # Obtener el vendedor asignado al lead
-                    lead_with_vendor = client.read("crm.lead", lead_id, ["user_id"])
-                    vendor_id = None
-                    if lead_with_vendor and lead_with_vendor.get("user_id"):
-                        vendor_id = lead_with_vendor["user_id"][0]
-
-                    if vendor_id:
-                        # Obtener número del vendedor
-                        vendor_sms = get_user_whatsapp_number(client, vendor_id)
-                        if vendor_sms and vendor_sms.startswith("whatsapp:"):
-                            vendor_sms = vendor_sms.replace("whatsapp:", "")
-                        # Validar número (quitar si tiene X)
-                        if vendor_sms and ("X" in vendor_sms or "x" in vendor_sms):
-                            vendor_sms = None
-
-                        # Preparar datos del lead para el mensaje
-                        # Obtener nombres de productos para el mensaje
-                        product_names = []
-                        for prod in products_added:
-                            try:
-                                prod_info = client.read(
-                                    "product.product", prod["product_id"], ["name"]
-                                )
-                                if prod_info:
-                                    product_names.append(
-                                        f"{prod_info['name']} (x{prod['qty']})"
-                                    )
-                            except:
-                                product_names.append(
-                                    f"Producto ID {prod['product_id']}"
-                                )
-
-                        lead_data_for_sms = {
-                            "sale_order_name": sale_order_name,
-                            "partner_name": partner_full_name,
-                            "ciudad": (
-                                ciudad if ciudad else "N/A"
-                            ),  # Usar parámetro primero
-                            "email": email,
-                            "products": (
-                                ", ".join(product_names) if product_names else "N/A"
-                            ),
-                        }
-
-                        # Si no se proporcionó ciudad, intentar obtenerla del partner
-                        if not ciudad:
-                            try:
-                                partner_data = client.read(
-                                    "res.partner", partner_id, ["city"]
-                                )
-                                if partner_data and partner_data.get("city"):
-                                    lead_data_for_sms["ciudad"] = partner_data["city"]
-                            except Exception as e:
-                                print(f"⚠️ No se pudo obtener ciudad del partner: {e}")
-
-                        # Enviar WhatsApp (reutilizando sms_client como lo hace message_notification)
-                        sms_result = sms_client.send_handoff_notification(
-                            user_phone=phone,
-                            reason="Nueva cotización generada",
-                            to_number=vendor_sms,
-                            user_name=contact_name,
-                            additional_context=f"Se generó la cotización {sale_order_name}",
-                            lead_data=lead_data_for_sms,
-                            assigned_user_id=vendor_id,
-                        )
-
-                        if sms_result["status"] == "success":
-                            notification_data = {
-                                "sent": True,
-                                "method": "whatsapp",
-                                "message_sid": sms_result.get("message_sid"),
-                                "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                "vendor_id": vendor_id,
-                                "vendor_number": vendor_sms or "default",
-                                "status": "success",
-                            }
-                            print(
-                                f"✅ WhatsApp de cotización enviado. SID: {sms_result.get('message_sid')}"
-                            )
-                        else:
-                            notification_data = {
-                                "sent": False,
-                                "method": "whatsapp",
-                                "status": "error",
-                                "error": sms_result.get("message"),
-                                "vendor_id": vendor_id,
-                            }
-                            print(
-                                f"⚠️ Error enviando WhatsApp de cotización: {sms_result.get('message')}"
-                            )
-                    else:
-                        print(
-                            "⚠️ No se pudo determinar el vendedor para enviar WhatsApp"
-                        )
-                        notification_data = {
-                            "sent": False,
-                            "method": "whatsapp",
-                            "status": "error",
-                            "error": "No vendor assigned to lead",
-                        }
-
-                except Exception as sms_error:
-                    print(f"❌ Error al enviar WhatsApp de cotización: {sms_error}")
-                    notification_data = {
-                        "sent": False,
-                        "method": "whatsapp",
-                        "status": "error",
-                        "error": str(sms_error),
-                    }
-
-                # Resultado final con notificación
-                result = {
-                    "partner_id": partner_id,
-                    "partner_name": partner_full_name,
-                    "lead_id": lead_id,
-                    "lead_name": lead_name,
-                    "opportunity_id": lead_id,
-                    "sale_order_id": sale_order_id,
-                    "sale_order_name": sale_order_name,
-                    "products_added": products_added,
-                    "description": lead_final.get("description"),
-                    "x_studio_producto": lead_final.get("x_studio_producto"),
-                    "steps": steps,
-                    "environment": "development",
-                    "notification": notification_data,  # Agregar info de notificación
-                }
-
-                # Marcar como completado
-                task.complete(result)
-
-                # Actualizar log
-                quotation_logger.update_quotation_log(
-                    tracking_id=tracking_id,
-                    output_data=result,
-                    status="completed",
-                    error=None,
-                )
-
-            except Exception as e:
-                # Marcar como fallido
-                import traceback
-
-                error_msg = str(e)
-
-                # Capturar más contexto del error
-                error_details = {
-                    "error_type": type(e).__name__,
-                    "error_message": error_msg[:500],  # Limitar tamaño
-                    "traceback": traceback.format_exc()[:1000],  # Limitar traceback
-                }
-
-                # Log más detallado
-                print(f"❌ Error en cotización {tracking_id}:")
-                print(f"   Tipo: {error_details['error_type']}")
-                print(f"   Mensaje: {error_details['error_message']}")
-
-                # Si es error HTML de Odoo
-                if error_msg.startswith("<!doctype html") or error_msg.startswith(
-                    "<!DOCTYPE"
-                ):
-                    error_msg = "Odoo server error (502/HTML response). Server may be down or overloaded."
-                    print(
-                        f"   ⚠️ Odoo devolvió HTML en lugar de XML-RPC - servidor caído o error 502"
-                    )
-
-                task.fail(error_msg)
-
-                # Log de error
-                quotation_logger.update_quotation_log(
-                    tracking_id=tracking_id,
-                    output_data=None,
-                    status="failed",
-                    error=error_msg,
-                )
-
-                # 🚨 ENVIAR NOTIFICACIÓN DE ERROR AL VENDEDOR
-                try:
-                    from core.whatsapp import sms_client
-
-                    # Construir contexto del error para el mensaje
-                    error_context = f"""❌ ERROR EN COTIZACIÓN
-
-Tracking ID: {tracking_id}
-Error: {error_details['error_type']}
-Mensaje: {error_details['error_message'][:200]}
-
-📋 Datos de entrada:
-Partner: {params.get('partner_name', 'N/A')}
-Email: {params.get('email', 'N/A')}
-Tel: {params.get('phone', 'N/A')}
-Producto ID: {params.get('product_id', 'N/A')}
-Ciudad: {params.get('ciudad', 'N/A')}"""
-
-                    # Enviar notificación al vendedor (con flag de error)
-                    notification_result = sms_client.send_handoff_notification(
-                        user_phone=params.get("phone", "N/A"),
-                        reason="Error en cotización",
-                        user_name=params.get("partner_name", "N/A"),
-                        additional_context=error_context,
-                        assigned_user_id=0,
-                        is_error_notification=True,  # NUEVO: flag para usar número fijo y validar ENABLE_ERROR_NOTIFICATIONS
-                    )
-
-                    if notification_result.get("status") == "success":
-                        print(
-                            f"📱 Notificación de error enviada. SID: {notification_result.get('message_sid')}"
-                        )
-                    else:
-                        print(
-                            f"⚠️ No se pudo enviar notificación de error: {notification_result.get('message')}"
-                        )
-
-                except Exception as notification_error:
-                    print(
-                        f"⚠️ Error al enviar notificación de fallo: {notification_error}"
-                    )
-
-        # Lanzar thread
-        thread = threading.Thread(target=execute_quotation_background, daemon=True)
-        thread.start()
-
-        # Retornar tracking_id inmediatamente
-        return {
-            "tracking_id": tracking_id,
-            "status": "queued",
-            "message": "Cotización en proceso. Usa dev_get_quotation_status() para consultar el estado.",
-            "estimated_time": "20-30 segundos",
-            "check_status_with": f"dev_get_quotation_status(tracking_id='{tracking_id}')",
-        }
 
     @mcp.tool(
         name="dev_get_quotation_status",
@@ -1032,3 +498,94 @@ Ciudad: {params.get('ciudad', 'N/A')}"""
             response["success"] = False  # Para ElevenLabs
 
         return response
+
+    @mcp.tool(
+        name="dev_update_lead_quotation",
+        description="Actualiza un lead EXISTENTE y crea una cotización a partir de él. Usa esta herramienta cuando ya tengas un lead_id y quieras actualizarlo + generar cotización.",
+    )
+    def dev_update_lead_quotation(
+        lead_id: int,
+        products: Optional[List[dict]] = None,
+        product_id: int = 0,
+        product_qty: float = 1.0,
+        product_price: float = -1.0,
+        update_lead_data: Optional[dict] = None,
+        description: Optional[str] = None,
+        x_studio_producto: Optional[int] = None,
+    ) -> dict:
+        """
+        Actualiza un lead EXISTENTE y crea una cotización a partir de él.
+
+        ✨ NUEVA HERRAMIENTA (Service Layer Pattern):
+        - Separada de dev_create_quotation para claridad
+        - Usa QuotationService compartido
+        - Retorna tracking_id para seguimiento asíncrono
+
+        DIFERENCIAS vs dev_create_quotation:
+        - ❌ NO crea partner nuevo
+        - ❌ NO crea lead nuevo
+        - ✅ Lee lead existente
+        - ✅ Actualiza campos del lead (opcional)
+        - ✅ Convierte a oportunidad (si no lo es)
+        - ✅ Crea orden de venta + productos
+
+        Flujo (ejecutado en background):
+        1. Lee lead existente por lead_id
+        2. Actualiza campos del lead (opcional)
+        3. Convierte a oportunidad (si no lo es)
+        4. Crea orden de venta
+        5. Agrega productos
+
+        Args:
+            lead_id: ID del lead existente (OBLIGATORIO, debe ser > 0)
+            products: Lista [{"product_id": int, "qty": float, "price": float}]
+            product_id: ID del producto [LEGACY]
+            product_qty: Cantidad [LEGACY]
+            product_price: Precio manual [LEGACY]
+            update_lead_data: Dict con campos a actualizar
+                Ejemplo: {"description": "Nuevo texto", "city": "CDMX", "priority": 3}
+            description: Descripción adicional
+            x_studio_producto: Producto principal (Many2one)
+
+        Returns:
+            dict con tracking_id, status, mode="update", lead_id, message
+
+        Ejemplo:
+            dev_update_lead_quotation(
+                lead_id=12345,
+                products=[
+                    {"product_id": 26156, "qty": 5, "price": 9000.0}
+                ],
+                update_lead_data={
+                    "description": "Cliente solicitó cambio de cantidad",
+                    "priority": "2"
+                }
+            )
+        """
+        # Validar lead_id
+        if not lead_id or lead_id <= 0:
+            return {
+                "error": "lead_id es obligatorio y debe ser mayor a 0",
+                "example": "dev_update_lead_quotation(lead_id=12345, products=[...])",
+            }
+
+        # Importar servicio
+        from core.quotation_service import QuotationService
+
+        # Obtener cliente Odoo
+        client = get_odoo_client()
+
+        # Crear servicio
+        service = QuotationService(client)
+
+        # Delegar al servicio
+        return service.create_from_existing_lead(
+            lead_id=lead_id,
+            products=products,
+            product_id=product_id,
+            product_qty=product_qty,
+            product_price=product_price,
+            update_lead_data=update_lead_data,
+            description=description,
+            x_studio_producto=x_studio_producto,
+        )

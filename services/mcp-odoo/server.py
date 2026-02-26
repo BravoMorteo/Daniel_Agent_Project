@@ -249,26 +249,19 @@ async def health_check():
 
 
 @app.post("/api/quotation/async", response_model=QuotationResponse)
-async def create_quotation_async(
-    request: QuotationRequest, background_tasks: BackgroundTasks
-):
+async def create_quotation_async(request: QuotationRequest):
     """
-    Crea una cotización completa de forma ASÍNCRONA.
+    Crea una cotización completa de forma ASÍNCRONA (desde cero).
+
+    ✨ NUEVA ARQUITECTURA (Service Layer Pattern):
+    - Usa QuotationService para toda la lógica
+    - Elimina código duplicado con herramientas MCP
+    - Mantiene compatibilidad con API existente
 
     FLUJO:
         1. Valida los datos del request
-        2. Genera un tracking_id único
-        3. Crea una tarea en TaskManager (estado: queued)
-        4. Programa procesamiento en background
-        5. Retorna tracking_id inmediatamente
-
-    El procesamiento en background:
-        - Crea/busca el cliente (partner)
-        - Crea el lead
-        - Crea la oportunidad
-        - Crea la orden de venta
-        - Agrega las líneas de productos
-        - Registra todo en logs (local + S3)
+        2. Usa QuotationService.create_from_scratch()
+        3. Retorna tracking_id inmediatamente
 
     Args:
         request (QuotationRequest): Datos de la cotización
@@ -277,19 +270,13 @@ async def create_quotation_async(
             - email: Email del contacto
             - phone: Teléfono del contacto
             - lead_name: Nombre del lead/oportunidad
-            - product_id: ID del producto en Odoo (opcional)
-            - products: Lista de productos (alternativa)
-            - product_qty: Cantidad (default: 1)
-            - product_price: Precio (default: -1 = precio de Odoo)
-        background_tasks: Gestor de tareas asíncronas de FastAPI
+            - product_id: ID del producto [LEGACY]
+            - products: Lista [{"product_id": int, "qty": float, "price": float}]
+            - product_qty: Cantidad (default: 1) [LEGACY]
+            - product_price: Precio (default: -1 = automático) [LEGACY]
 
     Returns:
-        QuotationResponse: Información del tracking
-            - tracking_id: ID para consultar el estado
-            - status: "queued" (en cola)
-            - message: Mensaje informativo
-            - estimated_time: Tiempo estimado de procesamiento
-            - status_url: URL para consultar el estado
+        QuotationResponse con tracking_id, status, message, estimated_time
 
     Ejemplo:
         POST /api/quotation/async
@@ -299,33 +286,41 @@ async def create_quotation_async(
             "email": "john@acme.com",
             "phone": "+1234567890",
             "lead_name": "Cotización Robot PUDU",
-            "product_id": 12345,
-            "product_qty": 2
-        }
-
-        → {
-            "tracking_id": "quot_abc123def456",
-            "status": "queued",
-            "message": "Cotización en proceso...",
-            "estimated_time": "20-30 segundos",
-            "status_url": "/api/quotation/status/quot_abc123def456"
+            "products": [{"product_id": 12345, "qty": 2, "price": 1000.0}]
         }
     """
-    # Generar tracking ID único
-    task_id = f"quot_{uuid.uuid4().hex[:12]}"
+    from core.quotation_service import QuotationService
+    from core.odoo_client import get_odoo_client
 
-    # Crear tarea en TaskManager
-    task = task_manager.create_task(task_id, request.dict())
+    # Obtener cliente Odoo
+    client = get_odoo_client()
 
-    # Programar procesamiento en background
-    background_tasks.add_task(process_quotation_background, task_id, request.dict())
+    # Crear servicio
+    service = QuotationService(client)
+
+    # Ejecutar creación desde cero
+    result = service.create_from_scratch(
+        partner_name=request.partner_name,
+        contact_name=request.contact_name,
+        email=request.email,
+        phone=request.phone,
+        lead_name=request.lead_name,
+        ciudad=request.ciudad,
+        user_id=request.user_id or 0,
+        product_id=request.product_id or 0,
+        product_qty=request.product_qty or 1.0,
+        product_price=request.product_price or -1.0,
+        products=request.products,
+        description=request.description,
+        x_studio_producto=request.x_studio_producto,
+    )
 
     return QuotationResponse(
-        tracking_id=task_id,
-        status="queued",
-        message="Cotización en proceso. Consulte el tracking_id.",
-        estimated_time="20-30 segundos",
-        status_url=f"/api/quotation/status/{task_id}",
+        tracking_id=result["tracking_id"],
+        status=result["status"],
+        message=result["message"],
+        estimated_time=result.get("estimated_time", "20-30 segundos"),
+        status_url=f"/api/quotation/status/{result['tracking_id']}",
     )
 
 
@@ -378,6 +373,94 @@ async def get_quotation_status(tracking_id: str):
     if not task:
         raise HTTPException(status_code=404, detail="Tracking ID no encontrado")
     return JSONResponse(content=task.to_dict())
+
+
+@app.post("/api/quotation/update-lead")
+async def update_lead_quotation(
+    lead_id: int,
+    products: list[dict] = None,
+    product_id: int = 0,
+    product_qty: float = 1.0,
+    product_price: float = -1.0,
+    update_lead_data: dict = None,
+    description: str = None,
+    x_studio_producto: int = None,
+):
+    """
+    Actualiza un lead EXISTENTE y crea una cotización a partir de él.
+
+    ✨ NUEVA HERRAMIENTA (Service Layer Pattern):
+    - Endpoint complementario a /api/quotation/async
+    - Usa QuotationService compartido con MCP tools
+    - Para leads que ya existen en Odoo
+
+    DIFERENCIAS vs /api/quotation/async:
+    - ❌ NO crea partner nuevo
+    - ❌ NO crea lead nuevo
+    - ✅ Lee lead existente
+    - ✅ Actualiza campos del lead (opcional)
+    - ✅ Convierte a oportunidad
+    - ✅ Crea orden de venta + productos
+
+    Args:
+        lead_id: ID del lead existente (OBLIGATORIO)
+        products: Lista [{"product_id": int, "qty": float, "price": float}]
+        product_id: ID del producto [LEGACY]
+        product_qty: Cantidad [LEGACY]
+        product_price: Precio manual [LEGACY]
+        update_lead_data: Dict con campos a actualizar
+            Ejemplo: {"description": "...", "city": "CDMX", "priority": 3}
+        description: Descripción adicional
+        x_studio_producto: Producto principal (Many2one)
+
+    Returns:
+        QuotationResponse con tracking_id, status="queued", message
+
+    Ejemplo:
+        POST /api/quotation/update-lead
+        {
+            "lead_id": 12345,
+            "products": [{"product_id": 26156, "qty": 5, "price": 9000.0}],
+            "update_lead_data": {
+                "description": "Cliente solicitó cambio",
+                "priority": "2"
+            }
+        }
+    """
+    # Validar lead_id
+    if not lead_id or lead_id <= 0:
+        raise HTTPException(
+            status_code=400, detail="lead_id es obligatorio y debe ser mayor a 0"
+        )
+
+    from core.quotation_service import QuotationService
+    from core.odoo_client import get_odoo_client
+
+    # Obtener cliente Odoo
+    client = get_odoo_client()
+
+    # Crear servicio
+    service = QuotationService(client)
+
+    # Ejecutar actualización de lead + cotización
+    result = service.create_from_existing_lead(
+        lead_id=lead_id,
+        products=products,
+        product_id=product_id,
+        product_qty=product_qty,
+        product_price=product_price,
+        update_lead_data=update_lead_data,
+        description=description,
+        x_studio_producto=x_studio_producto,
+    )
+
+    return QuotationResponse(
+        tracking_id=result["tracking_id"],
+        status=result["status"],
+        message=result["message"],
+        estimated_time=result.get("estimated_time", "15-25 segundos"),
+        status_url=f"/api/quotation/status/{result['tracking_id']}",
+    )
 
 
 @app.post("/api/elevenlabs/handoff")

@@ -12,6 +12,8 @@ venv/
 ENV/
 env/
 .virtualenv/
+respaldos_prompt/
+prompts para actualizar y crear/
 
 # Python cache
 __pycache__/
