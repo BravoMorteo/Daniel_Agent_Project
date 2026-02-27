@@ -674,6 +674,413 @@ async def elevenlabs_handoff(request: HandoffRequest):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# BULK EMAIL ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CONSULTAS GENÉRICAS A ODOO
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@app.post("/api/odoo/search")
+async def search_odoo_generic(request: dict):
+    """
+    Endpoint genérico para consultas a cualquier modelo de Odoo.
+
+    📌 USO:
+        - Consultar cualquier modelo de Odoo (crm.lead, sale.order, res.partner, etc.)
+        - Búsquedas flexibles con domain, IDs o filtros
+        - Seleccionar campos específicos a retornar
+
+    ESTRATEGIAS DE BÚSQUEDA (prioridad):
+        1. ids: Lista de IDs específicos
+        2. domain: Domain de Odoo (máxima flexibilidad)
+        3. filters: Filtros simples (automáticamente convertidos a domain)
+        4. default: Retorna todos los registros (limitado)
+
+    Args:
+        request (dict): Body del request con:
+            - model (str, REQUERIDO): Modelo de Odoo (ej: "crm.lead", "sale.order")
+            - fields (list[str], opcional): Campos a retornar (default: todos)
+            - ids (list[int], opcional): IDs específicos
+            - domain (list, opcional): Domain de Odoo
+            - filters (dict, opcional): Filtros simples
+            - limit (int, opcional): Límite de registros (default: 100)
+
+    Returns:
+        dict:
+            - total: Número total de registros encontrados
+            - count: Número de registros retornados
+            - records: Lista de registros con los campos solicitados
+            - model: Modelo consultado
+            - search_type: Tipo de búsqueda usado
+
+    Raises:
+        HTTPException 400: Si falta el campo 'model' o parámetros inválidos
+        HTTPException 500: Si falla la consulta a Odoo
+
+    Ejemplos:
+        # Buscar leads por IDs
+        POST /api/odoo/search
+        {
+            "model": "crm.lead",
+            "ids": [31697, 31698, 31699],
+            "fields": ["id", "name", "email_from"]
+        }
+
+        # Buscar ventas con domain
+        POST /api/odoo/search
+        {
+            "model": "sale.order",
+            "domain": [["state", "=", "sale"]],
+            "fields": ["id", "name", "amount_total"],
+            "limit": 50
+        }
+
+        # Buscar partners con filtros
+        POST /api/odoo/search
+        {
+            "model": "res.partner",
+            "filters": {
+                "is_company": true,
+                "country_id": 156
+            },
+            "fields": ["id", "name", "email"]
+        }
+
+        # Buscar todos los productos (limitado)
+        POST /api/odoo/search
+        {
+            "model": "product.product",
+            "fields": ["id", "name", "list_price"],
+            "limit": 20
+        }
+    """
+    from core.odoo_client import OdooClient
+
+    try:
+        # Validar modelo (requerido)
+        model = request.get("model")
+        if not model:
+            raise HTTPException(status_code=400, detail="El campo 'model' es requerido")
+
+        # Extraer parámetros
+        fields = request.get("fields")
+        ids = request.get("ids")
+        domain = request.get("domain")
+        filters = request.get("filters")
+        limit = request.get("limit", 100)
+
+        # Construir domain según prioridad
+        final_domain = []
+        search_type = "default"
+
+        if ids:
+            # PRIORIDAD 1: IDs específicos
+            final_domain = [["id", "in", ids]]
+            search_type = "ids"
+        elif domain:
+            # PRIORIDAD 2: Domain de Odoo
+            final_domain = domain
+            search_type = "domain"
+        elif filters:
+            # PRIORIDAD 3: Filtros simples
+            final_domain = [[key, "=", value] for key, value in filters.items()]
+            search_type = "filters"
+        # Si no hay nada, final_domain queda [] (todos los registros)
+
+        # Conectar a Odoo
+        odoo_client = OdooClient()
+
+        # Ejecutar búsqueda (search_read no soporta offset, solo limit)
+        records = odoo_client.search_read(
+            model=model, domain=final_domain, fields=fields, limit=limit
+        )
+
+        return {
+            "total": len(records),
+            "count": len(records),
+            "records": records,
+            "model": model,
+            "search_type": search_type,
+            "limit": limit,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error consultando modelo '{request.get('model')}': {str(e)}",
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# BULK EMAIL - ENVÍO MASIVO DE EMAILS A LEADS
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@app.post("/api/leads/bulk-email")
+async def create_bulk_email_job(
+    request: dict,
+    environment: str = "dev",
+):
+    """
+    Crea un job de email masivo a leads y lo procesa en background.
+
+    📌 INVOCADO POR:
+        - Zapier u otros sistemas de automatización
+        - Envía emails a leads con control de intentos
+
+    FLUJO:
+        1. Obtiene leads según estrategia (lead_ids > domain > filters > default)
+        2. Crea job con job_id único
+        3. Procesa en background por batches
+        4. Retorna job_id inmediatamente (non-blocking)
+
+    ESTRATEGIAS DE BÚSQUEDA (prioridad):
+        1. lead_ids: IDs específicos
+        2. domain: Domain de Odoo (avanzado)
+        3. filters: Filtros simples (days_ago, max_messages, etc.)
+        4. default: IDs fijos de testing
+
+    BATCHING:
+        - Batch size: 15 leads (configurable)
+        - Delay entre batches: 7 segundos
+        - Verifica intentos antes de enviar (max 3)
+
+    LOGGING:
+        - S3: outbound_mails/YYYY/MM/DD/job_id/
+        - Batch logs: batch_001.json, batch_002.json, etc.
+        - Final report: final_report_{job_id}.json
+
+    Args:
+        request (dict): Body del request con:
+            - lead_ids (list[int], opcional): IDs específicos
+            - domain (list, opcional): Domain de Odoo
+            - filters (dict, opcional): Filtros simples
+        environment (str): DEPRECADO - Mantener por compatibilidad
+
+    Returns:
+        dict: Job info
+            - job_id: ID único del job
+            - status: "queued" (procesando en background)
+            - total_leads: Número de leads a procesar
+            - estimated_duration_minutes: Duración estimada
+            - status_url: URL para consultar estado
+
+    Raises:
+        HTTPException 400: Si no se encontraron leads
+        HTTPException 500: Si falla la inicialización
+
+    Ejemplos:
+        # IDs específicos
+        POST /api/leads/bulk-email
+        {
+            "lead_ids": [31697, 31698, 31699]
+        }
+
+        # Domain de Odoo
+        POST /api/leads/bulk-email
+        {
+            "domain": [["create_date", ">=", "2026-01-01"]]
+        }
+
+        # Filtros simples
+        POST /api/leads/bulk-email
+        {
+            "filters": {
+                "days_ago": 60,
+                "max_messages": 2
+            }
+        }
+
+        # Default (IDs fijos)
+        POST /api/leads/bulk-email
+        {}
+    """
+    from core.bulk_email_service import BulkEmailService
+
+    try:
+        service = BulkEmailService()
+
+        # Extraer parámetros del body
+        lead_ids = request.get("lead_ids")
+        domain = request.get("domain")
+        filters = request.get("filters")
+
+        job_id = service.create_email_job(
+            environment=environment,
+            lead_ids=lead_ids,
+            domain=domain,
+            filters=filters,
+        )
+
+        job_info = service.get_job_status(job_id)
+
+        return {
+            "job_id": job_id,
+            "status": job_info["status"],
+            "total_leads": job_info["total_leads"],
+            "estimated_duration_minutes": round(job_info["total_leads"] * 2 / 60, 2),
+            "status_url": f"/api/leads/bulk-email/status/{job_id}",
+        }
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creando job: {str(e)}")
+
+
+@app.get("/api/leads/bulk-email/status/{job_id}")
+async def get_bulk_email_status(job_id: str):
+    """
+    Consulta el estado de un job de email masivo.
+
+    Estados posibles:
+        - queued: En cola, esperando procesamiento
+        - processing: En proceso
+        - completed: Completado exitosamente
+        - failed: Falló con error
+
+    Args:
+        job_id (str): ID del job
+
+    Returns:
+        dict: Estado completo del job
+            - job_id: ID del job
+            - status: Estado actual
+            - total_leads: Total de leads
+            - processed: Leads procesados
+            - successes: Emails enviados exitosamente
+            - failures: Emails fallidos
+            - skipped: Leads omitidos (max intentos)
+            - created_at: Timestamp de creación
+            - completed_at: Timestamp de finalización
+
+    Raises:
+        HTTPException 404: Si el job_id no existe
+
+    Ejemplo:
+        GET /api/leads/bulk-email/status/email_abc123
+
+        → {
+            "job_id": "email_abc123",
+            "status": "completed",
+            "environment": "dev",
+            "total_leads": 35,
+            "processed": 35,
+            "successes": 28,
+            "failures": 2,
+            "skipped": 5,
+            "created_at": "2026-02-26T10:00:00",
+            "completed_at": "2026-02-26T10:04:30"
+        }
+    """
+    from core.bulk_email_service import BulkEmailService
+
+    service = BulkEmailService()
+    job_info = service.get_job_status(job_id)
+
+    if not job_info:
+        raise HTTPException(status_code=404, detail="Job ID no encontrado")
+
+    return job_info
+
+
+@app.post("/api/leads/without-followup")
+async def get_leads_without_followup(
+    request: dict,
+    environment: str = "dev",
+):
+    """
+    Obtiene leads según la estrategia de búsqueda.
+
+    📌 USO:
+        - Ver leads disponibles para envío de emails
+        - Listar leads según diferentes criterios
+        - Auditoría de leads en el sistema
+
+    ESTRATEGIAS DE BÚSQUEDA (prioridad):
+        1. lead_ids: IDs específicos
+        2. domain: Domain de Odoo
+        3. filters: Filtros simples
+        4. default: IDs fijos de testing
+
+    Args:
+        request (dict): Body del request con:
+            - lead_ids (list[int], opcional): IDs específicos
+            - domain (list, opcional): Domain de Odoo
+            - filters (dict, opcional): Filtros simples
+        environment (str): DEPRECADO - Mantener por compatibilidad
+
+    Returns:
+        dict: Información de leads
+            - total_leads: Cantidad de leads encontrados
+            - search_type: Tipo de búsqueda usado
+            - leads: Lista de leads con todos sus campos
+
+    Ejemplos:
+        # IDs específicos
+        GET /api/leads/without-followup?lead_ids=[31697,31698,31699]
+
+        # Domain de Odoo (encoded)
+        GET /api/leads/without-followup?domain=[["create_date",">=","2026-01-01"]]
+
+        # Filtros simples
+        GET /api/leads/without-followup?filters={"days_ago":60,"max_messages":2}
+
+        # Default (IDs fijos)
+        GET /api/leads/without-followup
+                    "id": 31697,
+                    "name": "Servibot - Cotización",
+                    "email_from": "cliente@example.com",
+                    "phone": "5551234567",
+                    "partner_id": [123, "Cliente SA"],
+                    "user_id": [5, "Vendedor"]
+                },
+                ...
+            ]
+        }
+    """
+    from core.bulk_email_service import BulkEmailService
+
+    try:
+        service = BulkEmailService()
+
+        # Extraer parámetros del body
+        lead_ids = request.get("lead_ids")
+        domain = request.get("domain")
+        filters = request.get("filters")
+
+        # Obtener leads
+        leads = service.get_leads(
+            environment=environment,
+            lead_ids=lead_ids,
+            domain=domain,
+            filters=filters,
+        )
+
+        # Determinar tipo de búsqueda para la respuesta
+        search_type = "default"
+        if lead_ids:
+            search_type = "lead_ids"
+        elif domain:
+            search_type = "domain"
+        elif filters:
+            search_type = "filters"
+
+        return {
+            "total_leads": len(leads),
+            "search_type": search_type,
+            "leads": leads,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error obteniendo leads: {str(e)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # MAIN - PUNTO DE ENTRADA
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -710,6 +1117,15 @@ if __name__ == "__main__":
     )
     print(
         f"   • WhatsApp Handoff: http://{Config.HOST}:{Config.PORT}/api/elevenlabs/handoff"
+    )
+    print(
+        f"   • Bulk Email:       http://{Config.HOST}:{Config.PORT}/api/leads/bulk-email"
+    )
+    print(
+        f"   • Email Status:     http://{Config.HOST}:{Config.PORT}/api/leads/bulk-email/status/{{id}}"
+    )
+    print(
+        f"   • Without Followup: http://{Config.HOST}:{Config.PORT}/api/leads/without-followup"
     )
     print(f"   • Health Check:     http://{Config.HOST}:{Config.PORT}/health")
     print(f"   • API Docs:         http://{Config.HOST}:{Config.PORT}/docs")

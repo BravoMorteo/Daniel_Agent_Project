@@ -12,11 +12,31 @@ class OdooClient:
         username: str | None = None,
         password: str | None = None,
     ):
-        self.url = (url or os.environ["ODOO_URL"]).rstrip("/")
-        self.db = db or os.environ["ODOO_DB"]
-        self.username = username or os.environ["ODOO_LOGIN"]
-        # Usa API key como password
-        self.password = password or os.environ["ODOO_API_KEY"]
+        # Detectar ambiente de ODOO_ENVIRONMENT (dev o prod)
+        environment = os.getenv("ODOO_ENVIRONMENT", "dev").lower()
+
+        # Si no se pasan parámetros, usar credenciales según el ambiente
+        if url is None and db is None and username is None and password is None:
+            if environment == "prod":
+                # Producción
+                self.url = os.environ["ODOO_URL"].rstrip("/")
+                self.db = os.environ["ODOO_DB"]
+                self.username = os.environ["ODOO_LOGIN"]
+                self.password = os.environ["ODOO_API_KEY"]
+                print(f"🌍 OdooClient: Conectando a PRODUCCIÓN ({self.url})")
+            else:
+                # Desarrollo
+                self.url = os.environ["DEV_ODOO_URL"].rstrip("/")
+                self.db = os.environ["DEV_ODOO_DB"]
+                self.username = os.environ["DEV_ODOO_LOGIN"]
+                self.password = os.environ["DEV_ODOO_API_KEY"]
+                print(f"🌍 OdooClient: Conectando a DESARROLLO ({self.url})")
+        else:
+            # Usar parámetros proporcionados
+            self.url = (url or os.environ["ODOO_URL"]).rstrip("/")
+            self.db = db or os.environ["ODOO_DB"]
+            self.username = username or os.environ["ODOO_LOGIN"]
+            self.password = password or os.environ["ODOO_API_KEY"]
 
         # Conexión XML-RPC con allow_none=True para manejar valores None de Odoo
         self.common = xmlrpc.client.ServerProxy(
