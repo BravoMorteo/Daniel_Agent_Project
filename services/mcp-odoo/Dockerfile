@@ -18,7 +18,8 @@ RUN pip install --upgrade pip && \
                 "requests>=2.32.5" \
                 "fastapi>=0.115.0" \
                 "boto3>=1.34.0" \
-                "twilio>=9.0.0"
+                "twilio>=9.0.0" \
+                "fastmcp>=2.14.4"
 
 # Copiar el resto del código
 COPY . /app
