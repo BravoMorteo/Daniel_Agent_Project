@@ -1,6 +1,10 @@
 """
 Servicio para envío masivo de emails a leads.
 Procesamiento por batches con threading no-bloqueante.
+
+🔗 FUENTE DE DATOS:
+    - Ambiente Odoo controlado por variable ODOO_ENVIRONMENT (dev/production)
+    - OdooClient detecta automáticamente el ambiente
 """
 
 import os
@@ -18,7 +22,12 @@ class BulkEmailService:
     """Gestiona el envío masivo de emails con control de intentos y batching"""
 
     def __init__(self):
-        """Inicializa el servicio de email masivo"""
+        """
+        Inicializa el servicio de email masivo.
+
+        El ambiente Odoo (dev/production) se detecta automáticamente desde
+        la variable de entorno ODOO_ENVIRONMENT en OdooClient.
+        """
         # Cliente Odoo detecta automáticamente ODOO_ENVIRONMENT
         self.odoo_client = OdooClient()
         self.jobs: Dict[str, Dict[str, Any]] = {}  # job_id -> job_info
@@ -37,7 +46,10 @@ class BulkEmailService:
                 "Faltan variables de entorno: LAMBDA_ODOO_SUPERVISOR_URL o LAMBDA_EMAIL_SENDER_URL"
             )
 
-        print(f"✅ BulkEmailService inicializado (batch_size={self.batch_size})")
+        odoo_env = os.getenv("ODOO_ENVIRONMENT", "dev")
+        print(
+            f"✅ BulkEmailService inicializado (batch_size={self.batch_size}, odoo={odoo_env})"
+        )
 
     def get_leads(
         self,
@@ -49,20 +61,26 @@ class BulkEmailService:
         """
         Obtiene leads según la estrategia de búsqueda.
 
-        PRIORIDAD DE BÚSQUEDA:
-        1. lead_ids → Busca por IDs específicos (ignora todo lo demás)
-        2. filters → Construye domain automáticamente desde filtros
-        3. domain → Usa domain de Odoo directamente
-        4. default → Filtro por defecto (últimos 60 días, ≤2 mensajes)
+        🔗 FUENTE DE DATOS:
+            - Ambiente Odoo controlado por ODOO_ENVIRONMENT (dev/production)
+            - Ignora el parámetro 'environment' (legacy, mantener por compatibilidad)
 
-        NOTA: El parámetro 'environment' es legacy y será deprecado.
-        La conexión a Odoo DEV/PROD se controla con ODOO_ENVIRONMENT.
+        PRIORIDAD DE BÚSQUEDA:
+            1. lead_ids → IDs específicos (ignora filters y domain)
+            2. filters → Filtros personalizados (days_ago, stage_id, user_id)
+            3. default → Filtro automático (>5 días, team_id=14, stage_id=1, sin actividad)
+
+        FILTRO DEFAULT (sin parámetros):
+            - create_date > 5 días
+            - team_id = 14 (Ventas servibot)
+            - stage_id = 1 (Nueva - Recien captada)
+            - Sin actividad humana (solo mensajes de bots: Lexi Aria, OdooBot)
 
         Args:
-            environment: DEPRECADO - Mantener por compatibilidad
+            environment: DEPRECADO - Usar ODOO_ENVIRONMENT variable de entorno
             lead_ids: Lista de IDs específicos a buscar
-            domain: Domain de Odoo para búsqueda avanzada
-            filters: Filtros simples (days_ago, max_messages, etc.)
+            domain: DEPRECADO - Usar filters
+            filters: Filtros personalizados (days_ago, stage_id, user_id)
 
         Returns:
             Lista de leads con id, name, partner_id, user_id, email_from, phone
@@ -72,12 +90,9 @@ class BulkEmailService:
             get_leads(lead_ids=[31697, 31698])
 
             # Filtros personalizados
-            get_leads(filters={"days_ago": 30, "max_messages": 5})
+            get_leads(filters={"days_ago": 10, "stage_id": 1, "user_id": 5})
 
-            # Domain de Odoo
-            get_leads(domain=[["create_date", ">=", "2026-01-01"]])
-
-            # Default (filtro: 60 días, ≤2 mensajes)
+            # Default (filtro automático)
             get_leads()
         """
         # PRIORIDAD 1: IDs específicos
@@ -85,49 +100,196 @@ class BulkEmailService:
             final_domain = [["id", "in", lead_ids]]
             search_type = f"IDs específicos ({len(lead_ids)} leads)"
 
-        # PRIORIDAD 2: Filtros simples (o default si no hay nada)
+        # PRIORIDAD 2: Filtros personalizados
+        elif filters:
+            final_domain = []
+
+            # Filtro: días atrás
+            if "days_ago" in filters:
+                days_ago = (
+                    datetime.now() - timedelta(days=filters["days_ago"])
+                ).strftime("%Y-%m-%d")
+                final_domain.append(["create_date", ">=", days_ago])
+
+            # Filtro: stage_id
+            if "stage_id" in filters:
+                final_domain.append(["stage_id", "=", filters["stage_id"]])
+
+            # Filtro: user_id
+            if "user_id" in filters:
+                final_domain.append(["user_id", "=", filters["user_id"]])
+
+            # Filtro: team_id
+            if "team_id" in filters:
+                final_domain.append(["team_id", "=", filters["team_id"]])
+
+            search_type = f"filtros personalizados ({len(final_domain)} condiciones)"
+
+        # PRIORIDAD 3: Filtro default (automático)
         else:
-            # Si no se pasan filtros, usar filtros por defecto
-            if not filters:
-                # Filtro default: leads creados después de fecha específica
-                final_domain = [["create_date", ">", "2026-02-25 23:24:05"]]
-                search_type = "filtro default (create_date > 2026-02-25 23:24:05)"
-            else:
-                final_domain = []
-
-                # Filtro: días atrás
-                if "days_ago" in filters:
-                    days_ago = (
-                        datetime.now() - timedelta(days=filters["days_ago"])
-                    ).strftime("%Y-%m-%d")
-                    final_domain.append(["create_date", ">=", days_ago])
-
-                # Filtro: máximo de mensajes (DESHABILITADO - campo no existe en Odoo)
-                # if "max_messages" in filters:
-                #     final_domain.append(["message_count", "<=", filters["max_messages"]])
-
-                # Filtro: stage_id
-                if "stage_id" in filters:
-                    final_domain.append(["stage_id", "=", filters["stage_id"]])
-
-                # Filtro: user_id
-                if "user_id" in filters:
-                    final_domain.append(["user_id", "=", filters["user_id"]])
-
-                search_type = f"filtros ({len(final_domain)} condiciones)"
+            # Filtro default: leads antiguos (más de 5 días) del equipo Ventas servibot con stage "Nueva (Recien captada)"
+            five_days_ago = (datetime.now() - timedelta(days=5)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            final_domain = [
+                ["create_date", "<=", five_days_ago],
+                ["team_id", "=", 14],  # Ventas servibot
+                ["stage_id", "=", 1],  # Nueva (Recien captada)
+            ]
+            search_type = f"filtro default (>5 días, team_id=14, stage_id=1, create_date<={five_days_ago})"
 
         fields = ["id", "name", "partner_id", "user_id", "email_from", "phone"]
 
         try:
-            leads = self.odoo_client.search_read("crm.lead", final_domain, fields)
+            # Obtener todos los leads que cumplan el filtro
+            leads = self.odoo_client.search_read(
+                "crm.lead", final_domain, fields, limit=5000
+            )
             odoo_env = os.getenv("ODOO_ENVIRONMENT", "dev")
             print(
-                f"📋 Obtenidos {len(leads)} leads (Odoo: {odoo_env}, búsqueda: {search_type})"
+                f"📋 Obtenidos {len(leads)} leads iniciales (Odoo {odoo_env.upper()}, búsqueda: {search_type})"
             )
+
+            # Filtrar leads sin actividad real (solo aplica al filtro default)
+            if not lead_ids and not filters:
+                leads = self._filter_leads_without_activity(leads)
+                print(f"📋 Filtrados {len(leads)} leads SIN actividad humana")
+
             return leads
         except Exception as e:
             print(f"❌ Error obteniendo leads: {e}")
             return []
+
+    def _filter_leads_without_activity(
+        self, leads: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Filtra leads que NO tienen actividad humana real en el chatter.
+
+        🤖 DETECCIÓN DE ACTIVIDAD:
+            - Mensajes de BOTS (Lexi Aria ID 109061, OdooBot ID 106917) = NO actividad
+            - Mensajes de HUMANOS (cualquier otro author_id) = SÍ actividad
+            - Attachments de HUMANOS = SÍ actividad
+            - Attachments de BOTS = NO actividad
+
+        Un lead SIN actividad SOLO tiene:
+            - Mensajes automáticos de Lexi Aria (ID 109061)
+            - Mensajes automáticos de OdooBot (ID 106917)
+            - Mensajes de sistema sin contenido
+
+        Cualquier mensaje o attachment de un humano = actividad → lead excluido
+
+        Args:
+            leads: Lista de leads a filtrar
+
+        Returns:
+            Lista de leads sin actividad humana
+        """
+        print("🚀 Filtrando leads sin actividad humana (BULK PROCESSING)...")
+
+        # IDs de bots automáticos
+        BOT_AUTHOR_IDS = [109061, 106917]  # Lexi Aria, OdooBot
+
+        # IDs de bots automáticos
+        BOT_AUTHOR_IDS = [109061, 106917]  # Lexi Aria, OdooBot
+
+        # PASO 1: Obtener todos los leads con message_ids
+        lead_ids = [lead["id"] for lead in leads]
+
+        leads_with_messages = self.odoo_client.search_read(
+            "crm.lead",
+            [["id", "in", lead_ids]],
+            ["id", "message_ids"],
+            limit=len(lead_ids),
+        )
+
+        # PASO 2: Recolectar TODOS los message_ids
+        lead_messages_map = {}
+        all_message_ids = []
+
+        for lead_data in leads_with_messages:
+            lead_id = lead_data["id"]
+            message_ids = lead_data.get("message_ids", [])
+            lead_messages_map[lead_id] = message_ids
+            all_message_ids.extend(message_ids)
+
+        print(f"   📧 Total mensajes a analizar: {len(all_message_ids)}")
+
+        # PASO 3: Obtener TODOS los mensajes en batches
+        batch_size = 500
+        all_messages = []
+
+        for i in range(0, len(all_message_ids), batch_size):
+            batch_ids = all_message_ids[i : i + batch_size]
+
+            messages = self.odoo_client.search_read(
+                "mail.message",
+                [["id", "in", batch_ids]],
+                ["id", "body", "message_type", "attachment_ids", "author_id"],
+                limit=len(batch_ids),
+            )
+
+            all_messages.extend(messages)
+
+        print(f"   💾 Total mensajes obtenidos: {len(all_messages)}")
+
+        # PASO 4: Indexar mensajes por ID
+        messages_by_id = {msg["id"]: msg for msg in all_messages}
+
+        # PASO 5: Filtrar leads sin actividad humana
+        filtered_leads = []
+        excluded_count = 0
+
+        for lead in leads:
+            lead_id = lead["id"]
+            message_ids = lead_messages_map.get(lead_id, [])
+
+            # Si no tiene mensajes, NO tiene actividad
+            if not message_ids:
+                filtered_leads.append(lead)
+                continue
+
+            has_activity = False
+
+            for msg_id in message_ids:
+                msg = messages_by_id.get(msg_id)
+                if not msg:
+                    continue
+
+                author_id = (
+                    msg.get("author_id", [False])[0] if msg.get("author_id") else False
+                )
+                attachment_ids = msg.get("attachment_ids", [])
+
+                # Attachments de humanos = actividad
+                if (
+                    attachment_ids
+                    and len(attachment_ids) > 0
+                    and author_id not in BOT_AUTHOR_IDS
+                ):
+                    has_activity = True
+                    break
+
+                # Mensajes de humanos con contenido = actividad
+                if author_id and author_id not in BOT_AUTHOR_IDS:
+                    body = msg.get("body", "") or ""
+                    import re
+
+                    body_clean = re.sub(r"<[^>]+>", "", body).strip()
+
+                    if body_clean:
+                        has_activity = True
+                        break
+
+            if has_activity:
+                excluded_count += 1
+            else:
+                filtered_leads.append(lead)
+
+        print(f"   ✅ Leads sin actividad humana: {len(filtered_leads)}")
+        print(f"   ❌ Leads excluidos (con actividad): {excluded_count}")
+
+        return filtered_leads
 
     def check_lead_attempts(self, lead_id: int) -> Dict[str, Any]:
         """

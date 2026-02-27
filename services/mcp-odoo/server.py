@@ -833,21 +833,30 @@ async def create_bulk_email_job(
         - Zapier u otros sistemas de automatización
         - Envía emails a leads con control de intentos
 
+    🔗 FUENTE DE DATOS:
+        - Ambiente Odoo controlado por variable ODOO_ENVIRONMENT (dev/production)
+        - Usa BulkEmailService.get_leads() para obtener leads
+
     FLUJO:
-        1. Obtiene leads según estrategia (lead_ids > domain > filters > default)
+        1. Obtiene leads según estrategia (lead_ids > filters > default)
         2. Crea job con job_id único
         3. Procesa en background por batches
         4. Retorna job_id inmediatamente (non-blocking)
 
     ESTRATEGIAS DE BÚSQUEDA (prioridad):
         1. lead_ids: IDs específicos
-        2. domain: Domain de Odoo (avanzado)
-        3. filters: Filtros simples (days_ago, max_messages, etc.)
-        4. default: IDs fijos de testing
+        2. filters: Filtros personalizados (days_ago, stage_id, user_id)
+        3. default: Filtro automático (>5 días, team_id=14, stage_id=1, sin actividad humana)
+
+    FILTRO DEFAULT (sin parámetros):
+        - create_date > 5 días
+        - team_id = 14 (Ventas servibot)
+        - stage_id = 1 (Nueva - Recien captada)
+        - Sin actividad humana (solo mensajes de bots: Lexi Aria ID 109061, OdooBot ID 106917)
 
     BATCHING:
-        - Batch size: 15 leads (configurable)
-        - Delay entre batches: 7 segundos
+        - Batch size: 15 leads (configurable con EMAIL_BATCH_SIZE)
+        - Delay entre batches: 7 segundos (configurable con EMAIL_BATCH_DELAY_SECONDS)
         - Verifica intentos antes de enviar (max 3)
 
     LOGGING:
@@ -858,9 +867,8 @@ async def create_bulk_email_job(
     Args:
         request (dict): Body del request con:
             - lead_ids (list[int], opcional): IDs específicos
-            - domain (list, opcional): Domain de Odoo
             - filters (dict, opcional): Filtros simples
-        environment (str): DEPRECADO - Mantener por compatibilidad
+        environment (str): DEPRECADO - Usar ODOO_ENVIRONMENT variable de entorno
 
     Returns:
         dict: Job info
@@ -881,22 +889,17 @@ async def create_bulk_email_job(
             "lead_ids": [31697, 31698, 31699]
         }
 
-        # Domain de Odoo
-        POST /api/leads/bulk-email
-        {
-            "domain": [["create_date", ">=", "2026-01-01"]]
-        }
-
-        # Filtros simples
+        # Filtros personalizados
         POST /api/leads/bulk-email
         {
             "filters": {
-                "days_ago": 60,
-                "max_messages": 2
+                "days_ago": 10,
+                "stage_id": 1,
+                "user_id": 5
             }
         }
 
-        # Default (IDs fijos)
+        # Default (filtro automático)
         POST /api/leads/bulk-email
         {}
     """
@@ -907,13 +910,12 @@ async def create_bulk_email_job(
 
         # Extraer parámetros del body
         lead_ids = request.get("lead_ids")
-        domain = request.get("domain")
         filters = request.get("filters")
 
         job_id = service.create_email_job(
             environment=environment,
             lead_ids=lead_ids,
-            domain=domain,
+            domain=None,  # Domain deprecado, usar filters
             filters=filters,
         )
 
@@ -995,44 +997,67 @@ async def get_leads_without_followup(
     environment: str = "dev",
 ):
     """
-    Obtiene leads según la estrategia de búsqueda.
+    Obtiene leads según la estrategia de búsqueda (SOLO LECTURA - no envía emails).
 
     📌 USO:
         - Ver leads disponibles para envío de emails
         - Listar leads según diferentes criterios
-        - Auditoría de leads en el sistema
+        - Auditoría y validación de filtros antes de enviar emails masivos
+
+    🔗 FUENTE DE DATOS:
+        - Ambiente Odoo controlado por variable ODOO_ENVIRONMENT (dev/production)
+        - Usa BulkEmailService.get_leads() (misma función que /api/leads/bulk-email)
 
     ESTRATEGIAS DE BÚSQUEDA (prioridad):
         1. lead_ids: IDs específicos
-        2. domain: Domain de Odoo
-        3. filters: Filtros simples
-        4. default: IDs fijos de testing
+        2. filters: Filtros personalizados (days_ago, stage_id, user_id)
+        3. default: Filtro automático (>5 días, team_id=14, stage_id=1, sin actividad humana)
+
+    FILTRO DEFAULT (sin parámetros):
+        - create_date > 5 días
+        - team_id = 14 (Ventas servibot)
+        - stage_id = 1 (Nueva - Recien captada)
+        - Sin actividad humana (solo mensajes de bots: Lexi Aria ID 109061, OdooBot ID 106917)
 
     Args:
         request (dict): Body del request con:
             - lead_ids (list[int], opcional): IDs específicos
-            - domain (list, opcional): Domain de Odoo
             - filters (dict, opcional): Filtros simples
-        environment (str): DEPRECADO - Mantener por compatibilidad
+        environment (str): DEPRECADO - Usar ODOO_ENVIRONMENT variable de entorno
 
     Returns:
         dict: Información de leads
             - total_leads: Cantidad de leads encontrados
-            - search_type: Tipo de búsqueda usado
-            - leads: Lista de leads con todos sus campos
+            - search_type: Tipo de búsqueda usado ("lead_ids", "filters", "default")
+            - leads: Lista de leads con id, name, email_from, phone, partner_id, user_id
 
     Ejemplos:
         # IDs específicos
-        GET /api/leads/without-followup?lead_ids=[31697,31698,31699]
+        POST /api/leads/without-followup
+        {
+            "lead_ids": [31697, 31698, 31699]
+        }
 
-        # Domain de Odoo (encoded)
-        GET /api/leads/without-followup?domain=[["create_date",">=","2026-01-01"]]
+        # Filtros personalizados
+        POST /api/leads/without-followup
+        {
+            "filters": {
+                "days_ago": 10,
+                "stage_id": 1,
+                "user_id": 5
+            }
+        }
 
-        # Filtros simples
-        GET /api/leads/without-followup?filters={"days_ago":60,"max_messages":2}
+        # Default (filtro automático)
+        POST /api/leads/without-followup
+        {}
 
-        # Default (IDs fijos)
-        GET /api/leads/without-followup
+        Respuesta:
+        {
+            "total_leads": 32,
+            "search_type": "default",
+            "leads": [
+                {
                     "id": 31697,
                     "name": "Servibot - Cotización",
                     "email_from": "cliente@example.com",
@@ -1051,14 +1076,13 @@ async def get_leads_without_followup(
 
         # Extraer parámetros del body
         lead_ids = request.get("lead_ids")
-        domain = request.get("domain")
         filters = request.get("filters")
 
-        # Obtener leads
+        # Obtener leads (misma función que bulk-email)
         leads = service.get_leads(
             environment=environment,
             lead_ids=lead_ids,
-            domain=domain,
+            domain=None,  # Domain deprecado, usar filters
             filters=filters,
         )
 
@@ -1066,8 +1090,6 @@ async def get_leads_without_followup(
         search_type = "default"
         if lead_ids:
             search_type = "lead_ids"
-        elif domain:
-            search_type = "domain"
         elif filters:
             search_type = "filters"
 
