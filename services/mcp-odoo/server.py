@@ -46,9 +46,11 @@ FECHA: Enero 2026
 ═══════════════════════════════════════════════════════════════════════
 """
 
+import os
 import uvicorn
 import uuid
 from typing import Dict, Any
+from dotenv import load_dotenv
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.responses import JSONResponse
@@ -64,6 +66,15 @@ from core.api import (
 )
 from core.whatsapp import sms_client
 from tools import load_all
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# CARGAR VARIABLES DE ENTORNO
+# ═══════════════════════════════════════════════════════════════════════
+# Cargar .env antes de cualquier otra inicialización
+load_dotenv()
+print(f"🔧 Variables de entorno cargadas")
+print(f"🌍 ODOO_ENVIRONMENT = {os.getenv('ODOO_ENVIRONMENT', 'NOT SET')}")
 
 
 # ═══════════════════════════════════════════════════════════════════════

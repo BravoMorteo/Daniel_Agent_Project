@@ -187,11 +187,17 @@ class BulkEmailService:
         """
         print("🚀 Filtrando leads sin actividad humana (BULK PROCESSING)...")
 
-        # IDs de bots automáticos
-        BOT_AUTHOR_IDS = [109061, 106917]  # Lexi Aria, OdooBot
+        # IDs de bots automáticos según ambiente (mensajes de estos usuarios = NO actividad)
+        odoo_env = os.getenv("ODOO_ENVIRONMENT", "dev").lower()
 
-        # IDs de bots automáticos
-        BOT_AUTHOR_IDS = [109061, 106917]  # Lexi Aria, OdooBot
+        if odoo_env in ["prod", "production"]:
+            # PRODUCCIÓN: OdooBot ID 2, Lexi Aria ID 109061
+            BOT_AUTHOR_IDS = [2, 109061]
+            print(f"   🤖 Bots PRODUCCIÓN: OdooBot (2), Lexi Aria (109061)")
+        else:
+            # DESARROLLO: OdooBot ID 106917, Lexi Aria ID 109061
+            BOT_AUTHOR_IDS = [106917, 109061]
+            print(f"   🤖 Bots DESARROLLO: OdooBot (106917), Lexi Aria (109061)")
 
         # PASO 1: Obtener todos los leads con message_ids
         lead_ids = [lead["id"] for lead in leads]
