@@ -375,17 +375,73 @@ class BulkEmailService:
 
         try:
             # Lambda espera formato: {"function": "...", "params": {...}}
-            body_html = f"""Hola {name},
+            body_html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background-color: #f0f4f8; margin: 0; padding: 0; }}
+        .container {{ max-width: 600px; margin: 30px auto; background: #ffffff; border-radius: 16px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.08); }}
+        .header {{ background: #000000; padding: 25px; text-align: center; }}
+        .header img {{ max-width: 160px; }}
+        .hero {{ background: linear-gradient(135deg, #0052cc 0%, #002d72 100%); color: white; padding: 50px 30px; text-align: center; }}
+        .hero h1 {{ margin: 0; font-size: 26px; font-weight: 700; line-height: 1.2; }}
+        .hero p {{ opacity: 0.9; font-size: 16px; margin-top: 10px; }}
+        .content {{ padding: 40px; color: #2d3748; line-height: 1.6; }}
+        .lead-info {{ background: #ebf4ff; border-radius: 8px; padding: 15px; margin: 25px 0; font-size: 13px; color: #2b6cb0; border: 1px solid #bee3f8; }}
+        .highlight {{ color: #0052cc; font-weight: bold; }}
+        .benefits {{ list-style: none; padding: 0; margin: 25px 0; }}
+        .benefits li {{ margin-bottom: 12px; display: flex; align-items: center; font-size: 15px; }}
+        .benefits li::before {{ content: '🤖'; margin-right: 10px; }}
+        .cta-container {{ text-align: center; margin-top: 35px; }}
+        .btn-whatsapp {{ display: inline-block; background-color: #25D366; color: #ffffff !important; text-decoration: none; padding: 16px 30px; border-radius: 50px; font-weight: bold; font-size: 16px; box-shadow: 0 4px 12px rgba(37, 211, 102, 0.3); transition: 0.3s; }}
+        .reply-text {{ margin-top: 20px; font-size: 14px; color: #718096; }}
+        .footer {{ background: #f7fafc; padding: 25px; text-align: center; font-size: 12px; color: #a0aec0; border-top: 1px solid #edf2f7; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <img src="https://www.servibot.mx/web/image/website/7/logo?unique=fcb79f9" alt="Servibot">
+        </div>
 
-Espero te encuentres bien.
-Vimos que te interesaste por nuestros servicios de Servibot y quería saber si aún necesitas ayuda o asesoramiento.
+        <div class="hero">
+            <h1>¿Llevamos tu servicio al futuro?</h1>
+            <p>Tu solución Servibot está a un clic de distancia.</p>
+        </div>
 
-Esta información corresponde a tu solicitud de {name} registrada con el ID de lead {lead_id}.
+        <div class="content">
+            <p>Hola <strong>{name}</strong>,</p>
+            <p>Seguimos impulsando la innovación en México y queremos que seas parte de ello. Vimos tu interés en nuestras soluciones de <strong>robótica inteligente</strong> y no queremos que pierdas la oportunidad de transformar tu operación.</p>
+            
+            <div class="lead-info">
+                <strong>Referencia de Seguimiento:</strong> {attempt_number}<br>
+                <strong>ID de Lead:</strong> #{lead_id}
+            </div>
 
-En caso de que sigas interesado, con gusto te ayudaremos en lo que necesites.
+            <p>Nuestros robots no solo optimizan tareas; generan un impacto visual y operativo que <span class="highlight">dispara la rentabilidad</span> de tu negocio.</p>
 
-Saludos,
-Equipo Pegasus Control
+            <ul class="benefits">
+                <li>Atención al cliente de alto nivel.</li>
+                <li>Reducción real en costos operativos.</li>
+                <li>Implementación especializada y soporte local.</li>
+            </ul>
+
+            <div class="cta-container">
+                <a href="https://wa.me/message/LLZ2X6D44CXYJ1" class="btn-whatsapp">HABLAR POR WHATSAPP AHORA</a>
+                <p class="reply-text">O si lo prefieres, <strong>responde directamente a este correo</strong> y un asesor se pondrá en contacto contigo.</p>
+            </div>
+        </div>
+
+        <div class="footer">
+            <p><strong>Servibot México</strong><br>Tecnología que mueve tu mundo.</p>
+            <p><a href="https://www.servibot.mx" style="color: #0052cc; text-decoration: none;">www.servibot.mx</a></p>
+        </div>
+    </div>
+</body>
+</html>
 """
 
             response = requests.post(
@@ -441,7 +497,19 @@ Equipo Pegasus Control
                     "params": {
                         "lead_id": lead_id,
                         "max_attempts": 3,
-                        "message_template": f"📧 Intento {{attempt}} - Email enviado a {email} el {{date}}",
+                        "message_template": f"""Hola,
+
+Seguimos impulsando la innovación en México y queremos que seas parte de ello. Vimos tu interés en nuestras soluciones de robótica inteligente y no queremos que pierdas la oportunidad de transformar tu operación.
+
+Referencia de Seguimiento: {{attempt}}. ID de Lead: #{{lead_id}}.
+
+Nuestros robots no solo optimizan tareas; generan un impacto visual y operativo que dispara la rentabilidad de tu negocio. Ofrecen atención al cliente de alto nivel, una reducción real en costos operativos y una implementación especializada con soporte local.
+
+Habla por WhatsApp ahora o, si lo prefieres, responde directamente a este correo y un asesor se pondrá en contacto contigo.
+
+Servibot México. Tecnología que mueve tu mundo. www.servibot.mx
+
+📧 Intento {{attempt}} - Email enviado a {email} el {{date}}""",
                         "is_internal": True,
                     },
                 },
