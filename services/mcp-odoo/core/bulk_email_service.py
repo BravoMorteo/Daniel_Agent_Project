@@ -97,7 +97,7 @@ class BulkEmailService:
         """
         # PRIORIDAD 1: IDs específicos
         if lead_ids:
-            final_domain = [["id", "in", lead_ids]]
+            final_domain = [["id", "in", lead_ids], ["type", "=", "lead"]]
             search_type = f"IDs específicos ({len(lead_ids)} leads)"
 
         # PRIORIDAD 2: Filtros personalizados
@@ -122,6 +122,11 @@ class BulkEmailService:
             # Filtro: team_id
             if "team_id" in filters:
                 final_domain.append(["team_id", "=", filters["team_id"]])
+            # Asegurar que se filtren solo records de tipo 'lead' a menos que se especifique otro tipo
+            if "type" in filters:
+                final_domain.append(["type", "=", filters["type"]])
+            else:
+                final_domain.append(["type", "=", "lead"])
 
             search_type = f"filtros personalizados ({len(final_domain)} condiciones)"
 
@@ -135,6 +140,7 @@ class BulkEmailService:
                 ["create_date", "<=", five_days_ago],
                 ["team_id", "=", 14],  # Ventas servibot
                 ["stage_id", "=", 1],  # Nueva (Recien captada)
+                ["type", "=", "lead"],
             ]
             search_type = f"filtro default (>5 días, team_id=14, stage_id=1, create_date<={five_days_ago})"
 
@@ -379,7 +385,7 @@ class BulkEmailService:
 <!DOCTYPE html>
 <html>
 <head>
-    <meta charset="UTF-8">">
+    <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         body {{ font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; background-color: #f0f4f8; margin: 0; padding: 0; }}
@@ -444,6 +450,7 @@ class BulkEmailService:
 </html>
 """
 
+            # Enviar HTML en el campo `body` para compatibilidad con la Lambda
             response = requests.post(
                 self.lambda_email_url,
                 json={
@@ -497,19 +504,18 @@ class BulkEmailService:
                     "params": {
                         "lead_id": lead_id,
                         "max_attempts": 3,
-                        "message_template": f"""Hola,
+                        "message_template": f"""📧 Intento {{attempt}} - Email enviado a {email} el {{date}}. Contenido del recordatorio:       Hola ,
 
 Seguimos impulsando la innovación en México y queremos que seas parte de ello. Vimos tu interés en nuestras soluciones de robótica inteligente y no queremos que pierdas la oportunidad de transformar tu operación.
 
-Referencia de Seguimiento: {{attempt}}. ID de Lead: #{{lead_id}}.
+Referencia de Seguimiento: {{attempt}} . ID de Lead: #{{lead_id}}.
 
 Nuestros robots no solo optimizan tareas; generan un impacto visual y operativo que dispara la rentabilidad de tu negocio. Ofrecen atención al cliente de alto nivel, una reducción real en costos operativos y una implementación especializada con soporte local.
 
 Habla por WhatsApp ahora o, si lo prefieres, responde directamente a este correo y un asesor se pondrá en contacto contigo.
 
 Servibot México. Tecnología que mueve tu mundo. www.servibot.mx
-
-📧 Intento {{attempt}} - Email enviado a {email} el {{date}}""",
+                        """,
                         "is_internal": True,
                     },
                 },

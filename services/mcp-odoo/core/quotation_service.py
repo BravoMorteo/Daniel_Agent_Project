@@ -540,7 +540,9 @@ class QuotationService:
                 task.update_progress("Convirtiendo a oportunidad...")
                 opportunity_values = {
                     "type": "opportunity",
-                    "stage_id": 1,
+                    # Mantener comportamiento consistente con create_from_scratch
+                    # donde se usa stage_id = 3 al convertir a oportunidad.
+                    "stage_id": 3,
                 }
                 if params.get("description"):
                     opportunity_values["description"] = params["description"]
