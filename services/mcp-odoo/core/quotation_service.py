@@ -714,15 +714,34 @@ class QuotationService:
                 "product_uom_qty": qty,
             }
 
-            # Precio manual o automático
+            # Precio manual o automático desde pricelist
             if price > 0:
                 line_values["price_unit"] = price
             else:
-                # Obtener precio de pricelist
-                product_data = self.client.read(
-                    "product.product", prod_id, ["list_price", "name"]
+                # Obtener precio del pricelist "Clientes nacionales servibot" (ID: 82)
+                pricelist_items = self.client.search_read(
+                    "product.pricelist.item",
+                    [["pricelist_id", "=", 82], ["product_id", "=", prod_id]],
+                    ["fixed_price"],
+                    limit=1,
                 )
-                line_values["price_unit"] = product_data.get("list_price", 0.0)
+
+                if pricelist_items:
+                    line_values["price_unit"] = pricelist_items[0].get(
+                        "fixed_price", 0.0
+                    )
+                    print(
+                        f"   💰 Precio desde pricelist 82: {line_values['price_unit']}"
+                    )
+                else:
+                    # Fallback: usar list_price del producto si no está en el pricelist
+                    product_data = self.client.read(
+                        "product.product", prod_id, ["list_price"]
+                    )
+                    line_values["price_unit"] = product_data.get("list_price", 0.0)
+                    print(
+                        f"   ⚠️  Producto no encontrado en pricelist 82, usando list_price: {line_values['price_unit']}"
+                    )
 
             line_id = self.client.create("sale.order.line", line_values)
             product_info = self.client.read("product.product", prod_id, ["name"])
